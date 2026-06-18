@@ -7,7 +7,7 @@ sync_to_github:
   before_script:
     - apk add --no-cache git openssh-client
     - mkdir -p ~/.ssh
-    - printf '%s' "$GITHUB_DEPLOY_KEY" > ~/.ssh/id_rsa
+    - echo "$GITHUB_DEPLOY_KEY" | tr -d ' ' | base64 -d > ~/.ssh/id_rsa
     - chmod 600 ~/.ssh/id_rsa
     - ssh-keyscan -H github.com >> ~/.ssh/known_hosts
   script:
