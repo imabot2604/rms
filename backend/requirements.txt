@@ -1,0 +1,22 @@
+# RMS backend dependencies
+
+# Web / API
+fastapi
+uvicorn
+python-multipart
+
+# Core data
+pandas
+numpy
+python-dateutil
+openpyxl
+
+# Forecasting stack (top-down package)
+prophet                 # top-level demand/profit drivers
+statsmodels             # ARIMA/ETS for smooth expense lines
+scikit-learn            # RandomForest ML nodes + ensemble utilities
+scikit-hts              # formal hierarchical reconciliation (hts_scikit mode)
+
+# Optional / future
+# xgboost               # drop-in upgrade for RandomForest nodes
+# hierarchicalforecast  # Nixtla reconciliation (planned 'nixtla' mode)
