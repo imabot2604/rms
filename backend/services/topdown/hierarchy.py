@@ -51,10 +51,38 @@ NODES: Dict[str, dict] = {
     # ---- Level 3: F&B revenue sub-lines (children of FBDeptRevenue) ----
     "BanquetRevenue": {"parent": "FBDeptRevenue", "level": 3, "source": "Banquet_Revenue"},
     "RestaurantLoungeRevenue": {"parent": "FBDeptRevenue", "level": 3, "source": "Restaurant_Revenue"},
+
+    # ---- Stable expense / non-operating lines (ARIMA/ETS targets) ----
+    # These sit under undistributed operating expenses or non-operating; they
+    # are smooth, slow-moving series well suited to ARIMA/ETS. Added additively;
+    # nodes whose source column is absent are skipped gracefully downstream.
+    "UtilitiesTotal": {"parent": "TotalDepartmentalExpenses", "level": 2, "source": "Utilities_Total"},
+    "ManagementFees": {"parent": None, "level": 1, "source": "Management_Fees"},
+    "PropertyTaxes": {"parent": None, "level": 1, "source": "Property_Taxes"},
+    "Insurance": {"parent": None, "level": 1, "source": "Insurance"},
+
+    # ---- ADR driver (ML target; not a summed COA line) ----
+    "ADR": {"parent": None, "level": 0, "source": "ADR"},
 }
 
 # Nodes that are forecast directly with Prophet (top-level drivers).
 TOP_LEVEL_FORECAST_NODES: List[str] = ["TotalOperatingRevenue", "GOP", "NOI"]
+
+# Stable expense / non-operating nodes forecast with ARIMA/ETS.
+COST_FORECAST_NODES: List[str] = [
+    "PropertyTaxes",
+    "Insurance",
+    "ManagementFees",
+    "UtilitiesTotal",
+]
+
+# Volatile / event-driven nodes forecast with tree-based ML models.
+ML_NODES: List[str] = [
+    "ADR",
+    "RoomDeptRevenue",
+    "BanquetRevenue",
+    "RestaurantLoungeRevenue",
+]
 
 
 def parent_of(node: str) -> Optional[str]:
