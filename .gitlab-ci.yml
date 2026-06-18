@@ -11,7 +11,7 @@ sync_to_github:
     - chmod 600 ~/.ssh/id_rsa
     - ssh-keyscan -H github.com >> ~/.ssh/known_hosts
   script:
-    - git clone --mirror https://gitlab.com/k123qwerty-group/rms.git
+    - git clone --mirror https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/k123qwerty-group/rms.git
     - cd rms.git
     - git push --mirror git@github.com:imabot2604/rms.git
   only:
