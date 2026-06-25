@@ -1,4 +1,5 @@
 import pandas as pd
+import pandas as pd
 import numpy as np
 import io
 import re
@@ -88,37 +89,70 @@ def _extract_month_columns(columns):
     return month_cols
 
 
+# Canonical schema mapping rules shared by header-based and USALI stat-block
+# (row-label-based) ingestion. Priority-ordered: first match wins per target.
+# NOTE: more specific rules MUST come before generic ones (e.g. 'total
+# departmental income' before 'total operating revenue').
+_SCHEMA_RULES = [
+    ('Date', lambda s: s == 'date' or 'date' in s or 'month' in s or 'period' in s),
+    ('Rooms_Available', lambda s: ('avail' in s and 'room' in s) or s == 'rooms available'
+                       or 'available room' in s or 'room nights available' in s),
+    ('Rooms_Sold', lambda s: (('sold' in s or 'demand' in s) and 'room' in s)
+                   or s == 'rooms sold' or 'room nights sold' in s),
+    ('Occupancy_Pct', lambda s: ('occ' in s and '%' in s) or s == 'occupancy %'
+                     or s == 'occupancy' or s == 'occupancy percent' or s.startswith('occupancy')),
+    ('ADR', lambda s: s == 'adr' or ('avg' in s and 'rate' in s)
+            or 'average daily rate' in s),
+    ('RevPAR', lambda s: 'revpar' in s or 'revenue per available room' in s),
+    ('Room_Revenue', lambda s: ('room' in s and ('rev' in s or 'department' in s) and 'total' in s)
+                     or s == 'room department' or s == 'rooms revenue'
+                     or s == 'room revenue' or s == 'total rooms revenue'),
+    ('FB_Revenue', lambda s: 'f&b' in s or ('food' in s and 'bev' in s)
+                   or s == 'food and beverages department' or s == 'f&b revenue'),
+    # Other operated departments / misc income lines (needed so revenue
+    # reconciles: Room + F&B + Other == Total Revenue).
+    ('Other_Revenue', lambda s: 'other operated' in s or 'minor operated' in s
+                      or s == 'other revenue' or 'miscellaneous income' in s
+                      or 'rentals and other income' in s or s == 'other income'),
+    ('Total_Departmental_Income', lambda s: 'total departmental income' in s
+                                  or 'total department income' in s
+                                  or 'departmental profit' in s),
+    ('Total_UOE', lambda s: 'total undistributed' in s or 'uoe' in s
+                  or 'total undistributed operating expenses' in s),
+    ('GOP', lambda s: 'gross operating profit' in s or s == 'gop' or s == 'gop %'),
+    # NOI: accept USALI 'Net Income (loss)' / 'Net Income loss' variants in
+    # addition to 'Net Operating Income'. Normalized to canonical NOI.
+    ('NOI', lambda s: 'net operating income' in s or s == 'noi'
+            or 'net income (loss)' in s or 'net income loss' in s
+            or s == 'net income' or 'ebitda' == s),
+    ('Total_Revenue', lambda s: 'total operating revenue' in s
+                      or s == 'total revenue' or 'total hotel revenue' in s),
+]
+
+
+def _match_schema_target(label, mapped_targets):
+    """Return the canonical target for a single label, or None."""
+    s = str(label).lower().strip()
+    for target, matcher in _SCHEMA_RULES:
+        if target in mapped_targets:
+            continue
+        try:
+            if matcher(s):
+                return target
+        except Exception:
+            continue
+    return None
+
+
 def _map_columns_to_schema(columns):
     """Map column names to our canonical schema using heuristics."""
     col_map = {}
     mapped_targets = set()
-
-    # Priority-ordered mapping rules (first match wins for each target)
-    rules = [
-        ('Date', lambda s: s == 'date' or 'date' in s or 'month' in s or 'period' in s),
-        ('Rooms_Available', lambda s: 'avail' in s and 'room' in s),
-        ('Rooms_Sold', lambda s: ('sold' in s or 'demand' in s) and 'room' in s),
-        ('Occupancy_Pct', lambda s: 'occ' in s and '%' in s or s == 'occupancy %' or s == 'occupancy'),
-        ('ADR', lambda s: s == 'adr' or ('avg' in s and 'rate' in s)),
-        ('RevPAR', lambda s: 'revpar' in s),
-        ('Room_Revenue', lambda s: ('room' in s and ('rev' in s or 'department' in s) and 'total' in s)
-                         or s == 'room department'),
-        ('FB_Revenue', lambda s: 'f&b' in s or ('food' in s and 'bev' in s)
-                       or s == 'food and beverages department'),
-        ('Total_UOE', lambda s: 'total undistributed' in s or 'uoe' in s),
-        ('GOP', lambda s: 'gross operating profit' in s or s == 'gop' or s == 'gop %'),
-        ('NOI', lambda s: 'net operating income' in s or s == 'noi'),
-        ('Total_Revenue', lambda s: 'total operating revenue' in s),
-    ]
-
     for col in columns:
-        col_str = str(col).lower().strip()
-        for target, matcher in rules:
-            if target not in mapped_targets and matcher(col_str):
-                col_map[col] = target
-                mapped_targets.add(target)
-                break
-
+        target = _match_schema_target(col, mapped_targets)
+        if target is not None:
+            col_map[col] = target
+            mapped_targets.add(target)
     return col_map
 
 
@@ -237,7 +271,7 @@ def process_uploaded_files(files):
 
         # 7. Ensure we have critical columns; try to compute missing ones
         if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df['Date'] = _parse_month_series(df['Date'])
             df = df.dropna(subset=['Date'])
 
         if 'Occupancy_Pct' in df.columns:
@@ -258,6 +292,11 @@ def process_uploaded_files(files):
         if 'Rooms_Sold' not in df.columns and 'Occupancy_Pct' in df.columns and 'Rooms_Available' in df.columns:
             df['Rooms_Sold'] = (df['Occupancy_Pct'] * df['Rooms_Available']).round(0)
 
+        # Derive accounting identities (Total_UOE, Other_Revenue) so the COA
+        # hierarchy reconciles. Built via a single batched concat (no per-column
+        # df.insert fragmentation).
+        df = derive_accounting_identities(df)
+
         dfs.append(df)
 
     if not dfs:
@@ -269,6 +308,11 @@ def process_uploaded_files(files):
         raise ValueError("Could not detect a Date/Month column in the uploaded files. "
                          "Ensure your file has month headers like 'Jan, 2023' or a 'Date' column.")
 
+    # Ensure deterministic datetime dtype before sorting.
+    if not np.issubdtype(master_df['Date'].dtype, np.datetime64):
+        master_df['Date'] = _parse_month_series(master_df['Date'])
+        master_df = master_df.dropna(subset=['Date'])
+
     master_df = master_df.sort_values(by='Date').reset_index(drop=True)
 
     # Drop duplicate dates (keep first occurrence, which is typically the most complete)
@@ -278,6 +322,76 @@ def process_uploaded_files(files):
     master_df = engineer_features(master_df)
 
     return master_df
+
+
+def _parse_month_series(series):
+    """
+    Parse month labels deterministically.
+
+    Fairfield/USALI wide files use labels like 'Jan, 2024'. We try a small set
+    of explicit formats first (fast, warning-free, deterministic) and only fall
+    back to generic inference for anything unmatched.
+    """
+    s = series.astype(str).str.strip()
+    result = pd.Series(pd.NaT, index=series.index, dtype='datetime64[ns]')
+
+    explicit_formats = ['%b, %Y', '%b %Y', '%B, %Y', '%B %Y', '%b-%y', '%b-%Y', '%Y-%m', '%m/%Y']
+    for fmt in explicit_formats:
+        mask = result.isna()
+        if not mask.any():
+            break
+        parsed = pd.to_datetime(s[mask], format=fmt, errors='coerce')
+        result[mask] = parsed
+
+    # Single generic fallback for any remaining unparsed labels.
+    mask = result.isna()
+    if mask.any():
+        result[mask] = pd.to_datetime(s[mask], errors='coerce')
+
+    return result
+
+
+def derive_accounting_identities(df):
+    """
+    Derive Total_UOE and Other_Revenue from available accounting identities so
+    the COA hierarchy reconciles even when the source omits these lines.
+
+    Identities used (best-effort, only when inputs exist):
+      * Other_Revenue = Total_Revenue - (Room_Revenue + FB_Revenue)
+      * Total_UOE     = Total_Departmental_Income - GOP
+                        (fallback) Total_Revenue - GOP
+
+    New columns are constructed in a single batched concat to avoid pandas
+    DataFrame fragmentation.
+    """
+    new_cols = {}
+
+    has = lambda c: c in df.columns and not df[c].isna().all()
+
+    # Other_Revenue so Room + F&B + Other == Total_Revenue.
+    if 'Other_Revenue' not in df.columns and has('Total_Revenue'):
+        room = df['Room_Revenue'] if 'Room_Revenue' in df.columns else 0
+        fb = df['FB_Revenue'] if 'FB_Revenue' in df.columns else 0
+        other = pd.to_numeric(df['Total_Revenue'], errors='coerce') \
+            - pd.to_numeric(room, errors='coerce').fillna(0) \
+            - pd.to_numeric(fb, errors='coerce').fillna(0)
+        # Only keep meaningful (non-trivial) residuals.
+        if other.abs().sum(skipna=True) > 1e-6:
+            new_cols['Other_Revenue'] = other
+
+    # Total_UOE fallback derivation so GOP can reconcile.
+    if 'Total_UOE' not in df.columns:
+        if has('Total_Departmental_Income') and has('GOP'):
+            new_cols['Total_UOE'] = pd.to_numeric(df['Total_Departmental_Income'], errors='coerce') \
+                - pd.to_numeric(df['GOP'], errors='coerce')
+        elif has('Total_Revenue') and has('GOP'):
+            new_cols['Total_UOE'] = pd.to_numeric(df['Total_Revenue'], errors='coerce') \
+                - pd.to_numeric(df['GOP'], errors='coerce')
+
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+    return df
 
 
 def engineer_features(df):

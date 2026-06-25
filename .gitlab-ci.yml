@@ -1,0 +1,15 @@
+stages:
+  - test
+
+backend_tests:
+  stage: test
+  image: python:3.11-slim
+  before_script:
+    - python -m pip install --upgrade pip
+    - pip install -r backend/requirements-test.txt
+  script:
+    - cd backend
+    - python -m pytest tests -q
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'

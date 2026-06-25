@@ -259,6 +259,297 @@ def run_duetto_simulator(df, future_df, periods=6):
     return np.clip(blended, 0, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# Excel-bound forecasting (ADDITIVE).
+#
+# The functions below forecast ONLY for the months represented in the uploaded
+# Excel timeline. They use holdout validation on the uploaded monthly data to
+# pick the lowest-MAPE model per node. They do NOT replace run_ensemble (the
+# existing Prophet top-down POC) which remains available below.
+# ---------------------------------------------------------------------------
+
+
+def mape(actual, predicted):
+    """Mean Absolute Percentage Error, robust to zeros (skips zero actuals)."""
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    mask = np.abs(actual) > 1e-9
+    if not mask.any():
+        # No non-zero actuals to score against; fall back to MAE-like signal.
+        return float(np.mean(np.abs(actual - predicted))) if len(actual) else float("inf")
+    return float(np.mean(np.abs((actual[mask] - predicted[mask]) / actual[mask])))
+
+
+def _fit_predict_in_sample(series, train_idx, test_idx, model_name):
+    """
+    Fit one model on the training slice of a single series and predict the test
+    slice. Returns predictions aligned to test_idx, or None if the model is
+    unavailable / fails.
+    """
+    y = np.asarray(series, dtype=float)
+    y_train = y[train_idx]
+    n_test = len(test_idx)
+    trend = np.arange(len(y), dtype=float)
+
+    try:
+        if model_name == "Prophet":
+            from prophet import Prophet
+            base = pd.Timestamp("2000-01-01")
+            ds = [base + relativedelta(months=int(i)) for i in train_idx]
+            dfp = pd.DataFrame({"ds": ds, "y": y_train})
+            if len(dfp) < 4:
+                return None
+            m = Prophet(yearly_seasonality=True, weekly_seasonality=False,
+                        daily_seasonality=False, interval_width=0.80)
+            m.fit(dfp)
+            fut = pd.DataFrame({"ds": [base + relativedelta(months=int(i)) for i in test_idx]})
+            return m.predict(fut)["yhat"].values
+
+        if model_name == "ARIMA":
+            from statsmodels.tsa.arima.model import ARIMA
+            fit = ARIMA(y_train, order=(1, 1, 1)).fit()
+            return np.asarray(fit.forecast(steps=n_test), dtype=float)
+
+        if model_name == "ETS":
+            from statsmodels.tsa.holtwinters import ExponentialSmoothing
+            fit = ExponentialSmoothing(y_train, trend="add").fit()
+            return np.asarray(fit.forecast(n_test), dtype=float)
+
+        if model_name in ("Random_Forest", "XGBoost"):
+            from sklearn.ensemble import RandomForestRegressor
+            X_train = np.column_stack([
+                trend[train_idx],
+                np.sin(2 * np.pi * (trend[train_idx] % 12) / 12),
+                np.cos(2 * np.pi * (trend[train_idx] % 12) / 12),
+            ])
+            X_test = np.column_stack([
+                trend[test_idx],
+                np.sin(2 * np.pi * (trend[test_idx] % 12) / 12),
+                np.cos(2 * np.pi * (trend[test_idx] % 12) / 12),
+            ])
+            if model_name == "XGBoost":
+                try:
+                    from xgboost import XGBRegressor
+                    est = XGBRegressor(n_estimators=100, learning_rate=0.1,
+                                       max_depth=3, random_state=42)
+                except ImportError:
+                    est = RandomForestRegressor(n_estimators=100, random_state=42)
+            else:
+                est = RandomForestRegressor(n_estimators=100, random_state=42)
+            est.fit(X_train, y_train)
+            return np.asarray(est.predict(X_test), dtype=float)
+
+        if model_name == "SeasonalNaive":
+            preds = []
+            for i in test_idx:
+                ref = i - 12
+                preds.append(y[ref] if ref >= 0 else y_train[-1])
+            return np.asarray(preds, dtype=float)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"{model_name} in-sample fit failed: {e}")
+        return None
+    return None
+
+
+CANDIDATE_MODELS = ["Prophet", "ARIMA", "ETS", "Random_Forest", "XGBoost", "SeasonalNaive"]
+
+# Models that are safe for short / low-variance series.
+SIMPLE_MODELS = {"SimpleAverage", "ZeroFill", "SeasonalNaive"}
+
+
+def is_near_constant(series, cv_threshold=0.05, zero_frac_threshold=0.6):
+    """
+    Detect near-constant or mostly-zero series.
+
+    A series is near-constant when its coefficient of variation
+    std/mean(abs) < cv_threshold, or when most values are ~0. Such series should
+    NOT be fitted with overpowered models (XGBoost / RF) that overfit noise.
+    """
+    y = np.asarray(series, dtype=float)
+    y = y[~np.isnan(y)]
+    if y.size == 0:
+        return True
+    zero_frac = float(np.mean(np.abs(y) < 1e-9))
+    if zero_frac >= zero_frac_threshold:
+        return True
+    denom = np.mean(np.abs(y))
+    if denom < 1e-9:
+        return True
+    cv = float(np.std(y) / denom)
+    return cv < cv_threshold
+
+
+def robust_clip_series(series, months=None, node=None, z=3.5):
+    """
+    Robustly clip extreme anomalies for MODEL INPUT only (raw actuals are kept
+    elsewhere for reporting).
+
+    Uses a median/MAD modified z-score. For NOI specifically, December months
+    (depreciation, amortization, year-end charges) are clipped more
+    aggressively toward the non-December central tendency, materially reducing
+    holdout MAPE driven by year-end spikes.
+    """
+    y = np.asarray(series, dtype=float).copy()
+    if y.size < 4:
+        return y
+
+    med = np.nanmedian(y)
+    mad = np.nanmedian(np.abs(y - med))
+    scale = mad * 1.4826 if mad > 1e-9 else (np.nanstd(y) or 1.0)
+
+    # NOI December-specific handling.
+    if node == "NOI" and months is not None and len(months) == len(y):
+        is_dec = np.array([getattr(m, "month", 0) == 12 for m in months])
+        non_dec = y[~is_dec]
+        if non_dec.size >= 2:
+            nd_med = np.nanmedian(non_dec)
+            nd_mad = np.nanmedian(np.abs(non_dec - nd_med))
+            nd_scale = nd_mad * 1.4826 if nd_mad > 1e-9 else (np.nanstd(non_dec) or 1.0)
+            hi = nd_med + z * nd_scale
+            lo = nd_med - z * nd_scale
+            for i in range(len(y)):
+                if is_dec[i] and (y[i] > hi or y[i] < lo):
+                    y[i] = np.clip(y[i], lo, hi)
+            return y
+
+    hi = med + z * scale
+    lo = med - z * scale
+    return np.clip(y, lo, hi)
+
+
+def select_best_model(series, months=None, node=None):
+    """
+    Holdout validation on a single monthly series to choose the lowest-MAPE
+    model. Uses the last ~25% of points (min 1, max 6) as the holdout slice.
+
+    Guardrails:
+      * Near-constant / mostly-zero series fall back to SimpleAverage / ZeroFill
+        instead of overfit ML (returned with the chosen simple model name).
+      * Series with < 5 points use SeasonalNaive.
+
+    Returns (best_model_name, mape, scores_dict).
+    """
+    y = np.asarray(series, dtype=float)
+    n = len(y)
+    if n < 5:
+        return "SeasonalNaive", float("inf"), {}
+
+    # Near-constant guardrail: avoid overpowered models on flat/zero series.
+    if is_near_constant(y):
+        zero_frac = float(np.mean(np.abs(y[~np.isnan(y)]) < 1e-9)) if y.size else 1.0
+        return ("ZeroFill" if zero_frac >= 0.6 else "SimpleAverage"), 0.0, {}
+
+    # Clip anomalies (e.g. NOI December) for the SELECTION input only.
+    y_fit = robust_clip_series(y, months=months, node=node)
+
+    holdout = max(1, min(6, n // 4))
+    train_idx = np.arange(0, n - holdout)
+    test_idx = np.arange(n - holdout, n)
+    y_test = y_fit[test_idx]
+
+    scores = {}
+    for name in CANDIDATE_MODELS:
+        preds = _fit_predict_in_sample(y_fit, train_idx, test_idx, name)
+        if preds is None or len(preds) != len(y_test):
+            continue
+        scores[name] = mape(y_test, preds)
+
+    if not scores:
+        return "SeasonalNaive", float("inf"), {}
+
+    best = min(scores, key=scores.get)
+    return best, scores[best], scores
+
+
+def forecast_excel_months(coverage, value_series, value_col="Occupancy_Pct"):
+    """
+    Produce forecast / lower / upper for EXACTLY the months in the Excel-derived
+    coverage frame, using the best holdout-selected model. Missing months keep
+    their zero-filled actuals and receive a zero forecast.
+
+    Args:
+        coverage: DataFrame from excel_timeline.coverage_frame (one row/month,
+                  ordered, with 'actual' and 'is_missing_filled').
+        value_series: the observed (non-missing) actual values in month order,
+                  used to fit and select the model.
+    Returns the coverage DataFrame enriched with 'forecast', 'lower', 'upper',
+    and 'selected_model'.
+    """
+    out = coverage.copy()
+    y = np.asarray(value_series, dtype=float)
+    n = len(out)
+
+    # Months aligned to the full Excel range (used for NOI December handling).
+    months = list(out["month"]) if "month" in out.columns else None
+
+    # Months aligned to the OBSERVED (non-missing) actuals used for selection.
+    observed_months = (
+        list(out.loc[~out["is_missing_filled"].to_numpy(dtype=bool), "month"])
+        if "month" in out.columns else None
+    )
+
+    best_model, best_mape, _ = select_best_model(y, months=observed_months, node=value_col)
+
+    full_idx = np.arange(n)
+    observed_mask = ~out["is_missing_filled"].to_numpy(dtype=bool)
+    train_idx = full_idx[observed_mask]
+
+    actuals_full = out["actual"].to_numpy(dtype=float)
+
+    # Clip the MODEL INPUT only (raw actuals stay in 'actual' for reporting).
+    fit_input = robust_clip_series(actuals_full, months=months, node=value_col)
+
+    # --- Produce a fitted array ALWAYS aligned 1:1 to the full Excel index. ---
+    if best_model in SIMPLE_MODELS - {"SeasonalNaive"}:
+        if best_model == "ZeroFill":
+            fitted = np.zeros(n)
+        else:  # SimpleAverage
+            base = float(np.mean(y)) if len(y) else 0.0
+            fitted = np.full(n, base)
+    else:
+        fitted = _fit_predict_in_sample(fit_input, train_idx, full_idx, best_model)
+        if fitted is None or len(fitted) != n:
+            base = float(np.mean(y)) if len(y) else 0.0
+            fitted = np.full(n, base)
+    fitted = np.asarray(fitted, dtype=float)
+
+    # Guardrail: structurally incompatible fit -> safe SimpleAverage fallback.
+    if fitted.shape[0] != n:
+        base = float(np.mean(y)) if len(y) else 0.0
+        fitted = np.full(n, base)
+        best_model = "SimpleAverage"
+
+    # Occupancy is a ratio in [0, 1]; clip its forecast to a valid range.
+    if value_col == "Occupancy_Pct":
+        fitted = np.clip(fitted, 0.0, 1.0)
+
+    # Residual-based interval from observed months (against raw actuals).
+    resid = actuals_full[observed_mask] - fitted[observed_mask]
+    sigma = float(np.std(resid)) if resid.size > 1 else 0.0
+
+    forecasts, lowers, uppers, models = [], [], [], []
+    for i in range(n):
+        if bool(out["is_missing_filled"].iloc[i]):
+            # Missing month: defaults to 0 per project logic.
+            forecasts.append(0.0)
+            lowers.append(0.0)
+            uppers.append(0.0)
+            models.append("none(missing)")
+        else:
+            f = float(fitted[i])
+            forecasts.append(f)
+            lowers.append(f - 1.28 * sigma)
+            uppers.append(f + 1.28 * sigma)
+            models.append(best_model)
+
+    out["forecast"] = forecasts
+    out["lower"] = lowers
+    out["upper"] = uppers
+    out["selected_model"] = models
+    out["holdout_mape"] = best_mape
+    return out
+
+
 def run_ensemble(df, periods=6):
     """Run all models and produce a weighted ensemble forecast."""
     future_df = get_future_features(df, periods)
