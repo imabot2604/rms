@@ -482,7 +482,13 @@ def forecast_excel_months(coverage, value_series, value_col="Occupancy_Pct"):
     # Months aligned to the full Excel range (used for NOI December handling).
     months = list(out["month"]) if "month" in out.columns else None
 
-    best_model, best_mape, _ = select_best_model(y, months=None, node=value_col)
+    # Months aligned to the OBSERVED (non-missing) actuals used for selection.
+    observed_months = (
+        list(out.loc[~out["is_missing_filled"].to_numpy(dtype=bool), "month"])
+        if "month" in out.columns else None
+    )
+
+    best_model, best_mape, _ = select_best_model(y, months=observed_months, node=value_col)
 
     full_idx = np.arange(n)
     observed_mask = ~out["is_missing_filled"].to_numpy(dtype=bool)
