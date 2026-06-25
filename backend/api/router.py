@@ -1,10 +1,13 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from typing import List
 from services.data_processing import process_uploaded_files, generate_otb_pace
-from services.models import run_ensemble
+from services.models import run_ensemble, forecast_excel_months
+from services.excel_timeline import coverage_frame
+from services.reconciliation import reconcile_topdown, COA_HIERARCHY
 import logging
 import json
 import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -120,4 +123,101 @@ async def get_forecast(horizon: int = 6):
         return {"status": "success", "horizon": horizon, "forecast": results}
     except Exception as e:
         logger.exception(f"Forecast failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Forecasting error: {str(e)}")
+
+
+# Nodes (COA accounts) we forecast on the Excel-bound timeline. Occupancy is the
+# primary demand driver; the remaining nodes participate in COA reconciliation.
+EXCEL_FORECAST_NODES = [
+    "Occupancy_Pct", "ADR", "RevPAR",
+    "Room_Revenue", "FB_Revenue", "Total_Revenue",
+    "Total_UOE", "GOP", "NOI",
+]
+
+
+@api_router.get("/forecast_excel")
+async def get_forecast_excel():
+    """
+    Forecast ONLY for the months represented in the uploaded Excel.
+
+    Behavior:
+      * The forecast horizon is bounded by the Excel's own first/last month.
+        No extra future months or unrelated horizons are created.
+      * Missing months inside the expected range are included, zero-filled, and
+        flagged with a strong MISSING_MONTH reason.
+      * Data-quality checks (occupancy recompute, impossible occupancy, negative
+        sold rooms, invalid available rooms) are applied and preserved.
+      * Per node, the lowest-MAPE model is chosen via holdout validation.
+      * Totals are reconciled top-down across the COA hierarchy.
+
+    Output rows contain: month, node, actual, forecast, lower, upper, dq_flag,
+    dq_reason, is_missing_filled.
+    """
+    if Store.master_df is None:
+        raise HTTPException(status_code=400, detail="No data uploaded yet. Please upload hotel data first.")
+
+    df = Store.master_df
+
+    try:
+        node_forecast_arrays = {}
+        per_node_tables = {}
+        timeline_info = None
+        sequence_info = None
+
+        for node in EXCEL_FORECAST_NODES:
+            if node not in df.columns or df[node].isna().all():
+                continue
+
+            coverage, timeline, sequence = coverage_frame(df, value_col=node)
+            timeline_info = timeline_info or timeline
+            sequence_info = sequence_info or sequence
+
+            # Observed (non-missing) actuals in month order for model selection.
+            observed = coverage.loc[~coverage["is_missing_filled"], "actual"].to_numpy(dtype=float)
+
+            node_table = forecast_excel_months(coverage, observed, value_col=node)
+            per_node_tables[node] = node_table
+            node_forecast_arrays[node] = node_table["forecast"].to_numpy(dtype=float)
+
+        if not per_node_tables:
+            raise ValueError("No forecastable numeric nodes found in the uploaded data.")
+
+        # Top-down COA reconciliation so child nodes sum to parent totals.
+        reconciled = reconcile_topdown(node_forecast_arrays, COA_HIERARCHY)
+
+        rows = []
+        for node, table in per_node_tables.items():
+            recon_vals = reconciled.get(node)
+            for i in range(len(table)):
+                fc = float(recon_vals[i]) if recon_vals is not None else float(table["forecast"].iloc[i])
+                rows.append({
+                    "month": table["label"].iloc[i],
+                    "node": node,
+                    "actual": _safe_float(table["actual"].iloc[i]),
+                    "forecast": _safe_float(fc),
+                    "lower": _safe_float(table["lower"].iloc[i]),
+                    "upper": _safe_float(table["upper"].iloc[i]),
+                    "dq_flag": table["dq_flag"].iloc[i],
+                    "dq_reason": table["dq_reason"].iloc[i],
+                    "is_missing_filled": bool(table["is_missing_filled"].iloc[i]),
+                    "selected_model": table["selected_model"].iloc[i],
+                    "holdout_mape": _safe_float(table["holdout_mape"].iloc[i]),
+                })
+
+        return {
+            "status": "success",
+            "timeline": {
+                "start": timeline_info["start"].isoformat(),
+                "end": timeline_info["end"].isoformat(),
+                "present_labels": timeline_info["labels"],
+                "expected_labels": sequence_info["labels"],
+                "missing_labels": [m.strftime("%b %Y") for m in sequence_info["missing_months"]],
+            },
+            "rows": rows,
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Excel-bound forecast failed: {e}")
         raise HTTPException(status_code=500, detail=f"Forecasting error: {str(e)}")
