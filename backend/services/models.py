@@ -343,7 +343,12 @@ def _fit_predict_in_sample(series, train_idx, test_idx, model_name):
             preds = []
             for i in test_idx:
                 ref = i - 12
-                preds.append(y[ref] if ref >= 0 else y_train[-1])
+                if ref >= 0:
+                    preds.append(y[ref])
+                else:
+                    # No prior year available — use mean of same calendar month across training
+                    same_month_vals = [y[j] for j in train_idx if j % 12 == i % 12]
+                    preds.append(np.mean(same_month_vals) if same_month_vals else float(np.mean(y[train_idx])))
             return np.asarray(preds, dtype=float)
     except Exception as e:  # pragma: no cover - defensive
         logger.warning(f"{model_name} in-sample fit failed: {e}")
@@ -435,7 +440,7 @@ def select_best_model(series, months=None, node=None):
         return "SeasonalNaive", float("inf"), {}
 
     # Near-constant guardrail: avoid overpowered models on flat/zero series.
-    if is_near_constant(y):
+    if is_near_constant(y) and node != "NOI":
         zero_frac = float(np.mean(np.abs(y[~np.isnan(y)]) < 1e-9)) if y.size else 1.0
         return ("ZeroFill" if zero_frac >= 0.6 else "SimpleAverage"), 0.0, {}
 
@@ -488,13 +493,40 @@ def forecast_excel_months(coverage, value_series, value_col="Occupancy_Pct"):
         if "month" in out.columns else None
     )
 
-    best_model, best_mape, _ = select_best_model(y, months=observed_months, node=value_col)
-
     full_idx = np.arange(n)
     observed_mask = ~out["is_missing_filled"].to_numpy(dtype=bool)
     train_idx = full_idx[observed_mask]
 
     actuals_full = out["actual"].to_numpy(dtype=float)
+    orig_actuals = actuals_full.copy()
+
+    december_adjustment = 0.0
+    if value_col == "NOI" and months is not None:
+        # 1. Before fitting, detect outlier months: flag any month where abs(value) > mean(abs(series)) + 2 * std(series)
+        mean_abs = np.mean(np.abs(orig_actuals))
+        std_val = np.std(orig_actuals)
+        outlier_thresh = mean_abs + 2.0 * std_val
+        is_outlier = np.abs(orig_actuals) > outlier_thresh
+        
+        # 2. Replace those flagged values with the same-month median from non-December months for model fitting purposes
+        is_dec = np.array([getattr(m, "month", 0) == 12 for m in months])
+        non_dec_vals = orig_actuals[~is_dec]
+        non_dec_median = np.nanmedian(non_dec_vals) if non_dec_vals.size > 0 else 0.0
+        
+        # Replace outliers in actuals_full
+        for i in range(n):
+            if is_outlier[i]:
+                actuals_full[i] = non_dec_median
+        
+        # 3. After generating fitted values, add back the December outlier as a fixed offset: december_adjustment = mean of actual Dec values in training
+        dec_in_train = [orig_actuals[j] for j in train_idx if getattr(months[j], "month", 0) == 12]
+        if dec_in_train:
+            december_adjustment = float(np.mean(dec_in_train))
+            
+        # Update y for model selection
+        y = actuals_full[observed_mask]
+
+    best_model, best_mape, _ = select_best_model(y, months=observed_months, node=value_col)
 
     # Clip the MODEL INPUT only (raw actuals stay in 'actual' for reporting).
     fit_input = robust_clip_series(actuals_full, months=months, node=value_col)
@@ -519,12 +551,18 @@ def forecast_excel_months(coverage, value_series, value_col="Occupancy_Pct"):
         fitted = np.full(n, base)
         best_model = "SimpleAverage"
 
+    # Add back the December outlier as a fixed offset
+    if value_col == "NOI" and months is not None:
+        for i in range(n):
+            if getattr(months[i], "month", 0) == 12:
+                fitted[i] += december_adjustment
+
     # Occupancy is a ratio in [0, 1]; clip its forecast to a valid range.
     if value_col == "Occupancy_Pct":
         fitted = np.clip(fitted, 0.0, 1.0)
 
     # Residual-based interval from observed months (against raw actuals).
-    resid = actuals_full[observed_mask] - fitted[observed_mask]
+    resid = orig_actuals[observed_mask] - fitted[observed_mask]
     sigma = float(np.std(resid)) if resid.size > 1 else 0.0
 
     forecasts, lowers, uppers, models = [], [], [], []
@@ -545,6 +583,7 @@ def forecast_excel_months(coverage, value_series, value_col="Occupancy_Pct"):
     out["forecast"] = forecasts
     out["lower"] = lowers
     out["upper"] = uppers
+    out["outlier_adjustment"] = december_adjustment
     out["selected_model"] = models
     out["holdout_mape"] = best_mape
     return out

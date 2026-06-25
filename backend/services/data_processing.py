@@ -265,6 +265,53 @@ def process_uploaded_files(files):
             except Exception as e:
                 raise ValueError(f"Failed to reshape data: {e}")
 
+            # Second pass: scan df_raw for KPI rows in the statistics block
+            kpi_labels = {
+                "occupancy %": "Occupancy_Pct",
+                "occupancy": "Occupancy_Pct",
+                "adr": "ADR",
+                "average daily rate": "ADR",
+                "revpar": "RevPAR",
+                "revenue per available room": "RevPAR",
+                "rooms available": "Rooms_Available",
+                "available rooms": "Rooms_Available",
+                "rooms sold": "Rooms_Sold",
+                "rooms occupied": "Rooms_Sold",
+                "demand": "Rooms_Sold",
+            }
+            
+            extracted_kpis = {}
+            for idx in range(len(df_raw)):
+                first_val = df_raw.iloc[idx, 0]
+                if pd.isna(first_val):
+                    continue
+                first_val_str = str(first_val).strip().lower()
+                if first_val_str.startswith('="') and first_val_str.endswith('"'):
+                    first_val_str = first_val_str[2:-1].strip()
+                elif first_val_str.startswith('"') and first_val_str.endswith('"'):
+                    first_val_str = first_val_str[1:-1].strip()
+                
+                kpi_name = kpi_labels.get(first_val_str)
+                if kpi_name:
+                    row_data = {}
+                    for col_idx, col_name in header_values.items():
+                        if col_name in month_cols:
+                            raw_val = df_raw.iloc[idx, col_idx]
+                            cleaned_val = _clean_cell(raw_val)
+                            try:
+                                val_float = float(cleaned_val)
+                                if kpi_name == "Occupancy_Pct" and val_float > 1.0:
+                                    val_float = val_float / 100.0
+                                row_data[col_name] = val_float
+                            except (ValueError, TypeError):
+                                row_data[col_name] = np.nan
+                    
+                    if kpi_name not in extracted_kpis:
+                        extracted_kpis[kpi_name] = row_data
+            
+            for kpi_name, row_data in extracted_kpis.items():
+                df[kpi_name] = df['Date'].map(row_data)
+
         # 6. Map columns to canonical schema
         col_map = _map_columns_to_schema(df.columns)
         df = df.rename(columns=col_map)
