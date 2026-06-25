@@ -299,3 +299,98 @@ def extract_pnl_rows(df_raw):
 
     monthly_df = monthly_df.sort_values("Date").reset_index(drop=True)
     return monthly_df, lineage, debug_report
+
+
+def extract_pnl_multi(raw_frames):
+    """
+    Extract and CONCATENATE multiple yearly workbooks into one continuous
+    monthly series.
+
+    Fairfield files are one year each (12 monthly columns). Forecasting with a
+    SeasonalNaive(12) lag REQUIRES the full multi-year history so the lag
+    reaches the prior year's actual (e.g. Jan 2025 -> Jan 2024) instead of
+    collapsing to a single year's mean.
+
+    Args:
+        raw_frames: list of header-less DataFrames (one per workbook).
+
+    Returns:
+        (monthly_df, lineage, debug_report) with months from all workbooks,
+        deduplicated and sorted ascending.
+    """
+    if not raw_frames:
+        raise ValueError("No workbook frames provided.")
+
+    per_year = []
+    merged_lineage = {}
+    matched_rows = []
+    unmatched_rows = []
+    duplicate_candidates = {}
+    for frame in raw_frames:
+        mdf, lin, dbg = extract_pnl_rows(frame)
+        per_year.append(mdf)
+        # Lineage: keep the first non-missing source label per metric.
+        for metric, info in lin.items():
+            if metric not in merged_lineage or (
+                merged_lineage[metric].get("source_type") == SRC_MISSING
+                and info.get("source_type") != SRC_MISSING
+            ):
+                merged_lineage[metric] = info
+        matched_rows.extend(dbg.get("matched_rows", []))
+        unmatched_rows.extend(dbg.get("unmatched_rows", []))
+        for k, v in dbg.get("duplicate_candidates", {}).items():
+            duplicate_candidates.setdefault(k, []).extend(v)
+
+    combined = pd.concat(per_year, ignore_index=True)
+    combined["Date"] = pd.to_datetime(combined["Date"])
+    combined = (combined.sort_values("Date")
+                .drop_duplicates(subset=["Date"], keep="first")
+                .reset_index(drop=True))
+
+    debug_report = {
+        "matched_rows": matched_rows,
+        "unmatched_rows": sorted(set(unmatched_rows)),
+        "duplicate_candidates": duplicate_candidates,
+        "missing_metrics": [k for k, v in merged_lineage.items()
+                            if v.get("source_type") == SRC_MISSING],
+        "months_detected": [pd.Timestamp(m).strftime("%b %Y") for m in combined["Date"]],
+        "total_months": len(combined),
+    }
+    return combined, merged_lineage, debug_report
+
+
+# Verified anchor values from the Fairfield Inn Newark Airport workbooks.
+# Used to fail loudly if extraction maps the wrong rows/columns.
+_EXTRACTION_ANCHORS = [
+    ("Room_Revenue", "2022-01-01", 264147.0, 5.0),
+    ("Total_Revenue", "2023-06-01", 609252.0, 5.0),
+    ("GOP", "2022-06-01", 340980.0, 5.0),
+]
+
+
+def validate_extraction(monthly_df, debug_report=None, anchors=None):
+    """
+    Assert known Fairfield anchor values are present in the extracted frame.
+
+    Raises ValueError (including the unmatched-row debug list) if any anchor is
+    missing or off by more than its tolerance. Anchors are skipped silently if
+    the relevant month is not in the data (e.g. partial uploads).
+    """
+    anchors = anchors or _EXTRACTION_ANCHORS
+    df = monthly_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"])
+    problems = []
+    for metric, month, expected, tol in anchors:
+        ts = pd.Timestamp(month)
+        if metric not in df.columns or (df["Date"] == ts).sum() == 0:
+            continue
+        actual = float(df.loc[df["Date"] == ts, metric].iloc[0])
+        if abs(actual - expected) > tol:
+            problems.append(f"{metric} {month}: got {actual:.2f}, expected ~{expected:.2f}")
+    if problems:
+        unmatched = (debug_report or {}).get("unmatched_rows", [])
+        raise ValueError(
+            "Extraction validation failed: " + "; ".join(problems)
+            + f". Unmatched rows: {unmatched}"
+        )
+    return True
