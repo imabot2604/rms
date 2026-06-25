@@ -155,7 +155,7 @@ def build_pnl_forecast(df_or_frames, horizon=12):
             "future_residuals": hierarchy_residuals(reconciled_future),
         },
         "validations": validations,
-        "last_actual_month": pd.Timestamp(monthly_df["Date"]).max().strftime("%b %Y")
+        "last_actual_month": pd.to_datetime(monthly_df["Date"]).max().strftime("%b %Y")
         if not monthly_df.empty else None,
     }
 
