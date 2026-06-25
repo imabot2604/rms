@@ -31,7 +31,7 @@ file represents and never produces unrelated future horizons.
    **first and last** month found in the file. The forecast horizon is exactly
    this range, no more.
 
-### Missing-month zero-fill
+### Missing-month and Missing-KPI zero-fill
 
 If a month inside the expected range is absent from the upload, it is still
 included in the output but:
@@ -40,6 +40,11 @@ included in the output but:
 - it is flagged with the strong reason `MISSING_MONTH`,
 - the row carries `is_missing_filled = true` (`isMissingFilled` on the client)
   so reporting can render it distinctly.
+
+Similarly, if an entire KPI or node (e.g., `Occupancy_Pct` or `ADR`) is missing 
+from the uploaded file entirely, the pipeline will still emit the full timeline 
+for that node. It will zero-fill all values and strongly flag every row with 
+`MISSING_NODE`, ensuring the reporting structure is perfectly consistent.
 
 ### Preserved data-quality checks
 
