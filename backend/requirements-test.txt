@@ -1,0 +1,8 @@
+# Minimal dependencies to run the Fairfield regression tests.
+# Heavy/optional forecasting libs (prophet, statsmodels, xgboost) are imported
+# lazily inside functions, so they are NOT required for the test suite.
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+python-dateutil>=2.8
+pytest>=7.4
