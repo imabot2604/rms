@@ -479,24 +479,46 @@ def forecast_excel_months(coverage, value_series, value_col="Occupancy_Pct"):
     y = np.asarray(value_series, dtype=float)
     n = len(out)
 
-    best_model, best_mape, _ = select_best_model(y) if len(y) >= 5 else ("SeasonalNaive", float("inf"), {})
+    # Months aligned to the full Excel range (used for NOI December handling).
+    months = list(out["month"]) if "month" in out.columns else None
 
-    # In-sample fitted values across the full Excel range (no horizon beyond it).
+    best_model, best_mape, _ = select_best_model(y, months=None, node=value_col)
+
     full_idx = np.arange(n)
-    # Train on observed months only; predict every month in the Excel range.
     observed_mask = ~out["is_missing_filled"].to_numpy(dtype=bool)
     train_idx = full_idx[observed_mask]
 
-    fitted = _fit_predict_in_sample(
-        out["actual"].to_numpy(dtype=float), train_idx, full_idx, best_model
-    )
-    if fitted is None or len(fitted) != n:
-        # Robust fallback: seasonal-naive-style mean of observed actuals.
+    actuals_full = out["actual"].to_numpy(dtype=float)
+
+    # Clip the MODEL INPUT only (raw actuals stay in 'actual' for reporting).
+    fit_input = robust_clip_series(actuals_full, months=months, node=value_col)
+
+    # --- Produce a fitted array ALWAYS aligned 1:1 to the full Excel index. ---
+    if best_model in SIMPLE_MODELS - {"SeasonalNaive"}:
+        if best_model == "ZeroFill":
+            fitted = np.zeros(n)
+        else:  # SimpleAverage
+            base = float(np.mean(y)) if len(y) else 0.0
+            fitted = np.full(n, base)
+    else:
+        fitted = _fit_predict_in_sample(fit_input, train_idx, full_idx, best_model)
+        if fitted is None or len(fitted) != n:
+            base = float(np.mean(y)) if len(y) else 0.0
+            fitted = np.full(n, base)
+    fitted = np.asarray(fitted, dtype=float)
+
+    # Guardrail: structurally incompatible fit -> safe SimpleAverage fallback.
+    if fitted.shape[0] != n:
         base = float(np.mean(y)) if len(y) else 0.0
         fitted = np.full(n, base)
+        best_model = "SimpleAverage"
 
-    # Residual-based interval from observed months.
-    resid = out["actual"].to_numpy(dtype=float)[observed_mask] - np.asarray(fitted)[observed_mask]
+    # Occupancy is a ratio in [0, 1]; clip its forecast to a valid range.
+    if value_col == "Occupancy_Pct":
+        fitted = np.clip(fitted, 0.0, 1.0)
+
+    # Residual-based interval from observed months (against raw actuals).
+    resid = actuals_full[observed_mask] - fitted[observed_mask]
     sigma = float(np.std(resid)) if resid.size > 1 else 0.0
 
     forecasts, lowers, uppers, models = [], [], [], []
