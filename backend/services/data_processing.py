@@ -307,6 +307,11 @@ def process_uploaded_files(files):
         raise ValueError("Could not detect a Date/Month column in the uploaded files. "
                          "Ensure your file has month headers like 'Jan, 2023' or a 'Date' column.")
 
+    # Ensure deterministic datetime dtype before sorting.
+    if not np.issubdtype(master_df['Date'].dtype, np.datetime64):
+        master_df['Date'] = _parse_month_series(master_df['Date'])
+        master_df = master_df.dropna(subset=['Date'])
+
     master_df = master_df.sort_values(by='Date').reset_index(drop=True)
 
     # Drop duplicate dates (keep first occurrence, which is typically the most complete)
