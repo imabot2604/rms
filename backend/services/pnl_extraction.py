@@ -76,6 +76,8 @@ CANONICAL_ROW_MAP = {
         "total operating revenue", "total hotel revenue", "total revenue",
     ],
     "Total_UOE": [
+        # Verified Fairfield label is 'Total Departmental Expenses'.
+        "total departmental expenses", "total department expenses",
         "total undistributed operating expenses",
         "total undistributed expenses", "total uoe", "uoe",
     ],
@@ -83,9 +85,12 @@ CANONICAL_ROW_MAP = {
         "gross operating profit", "gop",
     ],
     "NOI": [
-        # Product expects canonical NOI; original label preserved in lineage.
-        "net income loss", "net income (loss)", "net operating income",
-        "net income",
+        # Verified Fairfield label is 'Net Income loss' (no parens, lowercase
+        # 'loss'). normalize_label strips ( ) / so all variants collapse to
+        # 'net income loss'. Product expects canonical NOI; original label is
+        # preserved in lineage.
+        "net income loss", "net income (loss)", "net income/loss",
+        "net operating income", "net income",
     ],
     # Operational KPIs (may legitimately be absent in Fairfield files).
     "Occupancy_Pct": ["occupancy percent", "occupancy %", "occupancy", "occ %"],
