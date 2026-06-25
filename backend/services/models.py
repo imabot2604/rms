@@ -259,6 +259,192 @@ def run_duetto_simulator(df, future_df, periods=6):
     return np.clip(blended, 0, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# Excel-bound forecasting (ADDITIVE).
+#
+# The functions below forecast ONLY for the months represented in the uploaded
+# Excel timeline. They use holdout validation on the uploaded monthly data to
+# pick the lowest-MAPE model per node. They do NOT replace run_ensemble (the
+# existing Prophet top-down POC) which remains available below.
+# ---------------------------------------------------------------------------
+
+
+def mape(actual, predicted):
+    """Mean Absolute Percentage Error, robust to zeros (skips zero actuals)."""
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    mask = np.abs(actual) > 1e-9
+    if not mask.any():
+        # No non-zero actuals to score against; fall back to MAE-like signal.
+        return float(np.mean(np.abs(actual - predicted))) if len(actual) else float("inf")
+    return float(np.mean(np.abs((actual[mask] - predicted[mask]) / actual[mask])))
+
+
+def _fit_predict_in_sample(series, train_idx, test_idx, model_name):
+    """
+    Fit one model on the training slice of a single series and predict the test
+    slice. Returns predictions aligned to test_idx, or None if the model is
+    unavailable / fails.
+    """
+    y = np.asarray(series, dtype=float)
+    y_train = y[train_idx]
+    n_test = len(test_idx)
+    trend = np.arange(len(y), dtype=float)
+
+    try:
+        if model_name == "Prophet":
+            from prophet import Prophet
+            base = pd.Timestamp("2000-01-01")
+            ds = [base + relativedelta(months=int(i)) for i in train_idx]
+            dfp = pd.DataFrame({"ds": ds, "y": y_train})
+            if len(dfp) < 4:
+                return None
+            m = Prophet(yearly_seasonality=True, weekly_seasonality=False,
+                        daily_seasonality=False, interval_width=0.80)
+            m.fit(dfp)
+            fut = pd.DataFrame({"ds": [base + relativedelta(months=int(i)) for i in test_idx]})
+            return m.predict(fut)["yhat"].values
+
+        if model_name == "ARIMA":
+            from statsmodels.tsa.arima.model import ARIMA
+            fit = ARIMA(y_train, order=(1, 1, 1)).fit()
+            return np.asarray(fit.forecast(steps=n_test), dtype=float)
+
+        if model_name == "ETS":
+            from statsmodels.tsa.holtwinters import ExponentialSmoothing
+            fit = ExponentialSmoothing(y_train, trend="add").fit()
+            return np.asarray(fit.forecast(n_test), dtype=float)
+
+        if model_name in ("Random_Forest", "XGBoost"):
+            from sklearn.ensemble import RandomForestRegressor
+            X_train = np.column_stack([
+                trend[train_idx],
+                np.sin(2 * np.pi * (trend[train_idx] % 12) / 12),
+                np.cos(2 * np.pi * (trend[train_idx] % 12) / 12),
+            ])
+            X_test = np.column_stack([
+                trend[test_idx],
+                np.sin(2 * np.pi * (trend[test_idx] % 12) / 12),
+                np.cos(2 * np.pi * (trend[test_idx] % 12) / 12),
+            ])
+            if model_name == "XGBoost":
+                try:
+                    from xgboost import XGBRegressor
+                    est = XGBRegressor(n_estimators=100, learning_rate=0.1,
+                                       max_depth=3, random_state=42)
+                except ImportError:
+                    est = RandomForestRegressor(n_estimators=100, random_state=42)
+            else:
+                est = RandomForestRegressor(n_estimators=100, random_state=42)
+            est.fit(X_train, y_train)
+            return np.asarray(est.predict(X_test), dtype=float)
+
+        if model_name == "SeasonalNaive":
+            preds = []
+            for i in test_idx:
+                ref = i - 12
+                preds.append(y[ref] if ref >= 0 else y_train[-1])
+            return np.asarray(preds, dtype=float)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"{model_name} in-sample fit failed: {e}")
+        return None
+    return None
+
+
+CANDIDATE_MODELS = ["Prophet", "ARIMA", "ETS", "Random_Forest", "XGBoost", "SeasonalNaive"]
+
+
+def select_best_model(series):
+    """
+    Holdout validation on a single monthly series to choose the lowest-MAPE
+    model. Uses the last ~25% of points (min 1, max 6) as the holdout slice.
+    Returns (best_model_name, mape, scores_dict).
+    """
+    y = np.asarray(series, dtype=float)
+    n = len(y)
+    if n < 5:
+        return "SeasonalNaive", float("inf"), {}
+
+    holdout = max(1, min(6, n // 4))
+    train_idx = np.arange(0, n - holdout)
+    test_idx = np.arange(n - holdout, n)
+    y_test = y[test_idx]
+
+    scores = {}
+    for name in CANDIDATE_MODELS:
+        preds = _fit_predict_in_sample(y, train_idx, test_idx, name)
+        if preds is None or len(preds) != len(y_test):
+            continue
+        scores[name] = mape(y_test, preds)
+
+    if not scores:
+        return "SeasonalNaive", float("inf"), {}
+
+    best = min(scores, key=scores.get)
+    return best, scores[best], scores
+
+
+def forecast_excel_months(coverage, value_series, value_col="Occupancy_Pct"):
+    """
+    Produce forecast / lower / upper for EXACTLY the months in the Excel-derived
+    coverage frame, using the best holdout-selected model. Missing months keep
+    their zero-filled actuals and receive a zero forecast.
+
+    Args:
+        coverage: DataFrame from excel_timeline.coverage_frame (one row/month,
+                  ordered, with 'actual' and 'is_missing_filled').
+        value_series: the observed (non-missing) actual values in month order,
+                  used to fit and select the model.
+    Returns the coverage DataFrame enriched with 'forecast', 'lower', 'upper',
+    and 'selected_model'.
+    """
+    out = coverage.copy()
+    y = np.asarray(value_series, dtype=float)
+    n = len(out)
+
+    best_model, best_mape, _ = select_best_model(y) if len(y) >= 5 else ("SeasonalNaive", float("inf"), {})
+
+    # In-sample fitted values across the full Excel range (no horizon beyond it).
+    full_idx = np.arange(n)
+    # Train on observed months only; predict every month in the Excel range.
+    observed_mask = ~out["is_missing_filled"].to_numpy(dtype=bool)
+    train_idx = full_idx[observed_mask]
+
+    fitted = _fit_predict_in_sample(
+        out["actual"].to_numpy(dtype=float), train_idx, full_idx, best_model
+    )
+    if fitted is None or len(fitted) != n:
+        # Robust fallback: seasonal-naive-style mean of observed actuals.
+        base = float(np.mean(y)) if len(y) else 0.0
+        fitted = np.full(n, base)
+
+    # Residual-based interval from observed months.
+    resid = out["actual"].to_numpy(dtype=float)[observed_mask] - np.asarray(fitted)[observed_mask]
+    sigma = float(np.std(resid)) if resid.size > 1 else 0.0
+
+    forecasts, lowers, uppers, models = [], [], [], []
+    for i in range(n):
+        if bool(out["is_missing_filled"].iloc[i]):
+            # Missing month: defaults to 0 per project logic.
+            forecasts.append(0.0)
+            lowers.append(0.0)
+            uppers.append(0.0)
+            models.append("none(missing)")
+        else:
+            f = float(fitted[i])
+            forecasts.append(f)
+            lowers.append(f - 1.28 * sigma)
+            uppers.append(f + 1.28 * sigma)
+            models.append(best_model)
+
+    out["forecast"] = forecasts
+    out["lower"] = lowers
+    out["upper"] = uppers
+    out["selected_model"] = models
+    out["holdout_mape"] = best_mape
+    return out
+
+
 def run_ensemble(df, periods=6):
     """Run all models and produce a weighted ensemble forecast."""
     future_df = get_future_features(df, periods)
