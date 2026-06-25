@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 # Other_Revenue is an explicit child to make top-down scaling mathematically
 # correct (Room + F&B + Other == Total_Revenue).
 COA_HIERARCHY = {
-    "Total_Revenue": ["Room_Revenue", "FB_Revenue", "Other_Revenue"],
-    "GOP": ["Total_Revenue", "Total_UOE"],
     "NOI": ["GOP"],
+    "GOP": ["Total_Revenue", "Total_UOE"],
+    "Total_Revenue": ["Room_Revenue", "FB_Revenue", "Other_Revenue"],
 }
 
 

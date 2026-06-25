@@ -134,3 +134,47 @@ def test_reconciliation_alignment_guardrail():
     arrays = {"Total_Revenue": np.ones(12), "Room_Revenue": np.ones(11)}
     with pytest.raises(ReconciliationError):
         reconcile_topdown(arrays)
+
+
+def test_seasonal_naive_fallback_same_month_mean():
+    from services.models import _fit_predict_in_sample
+    y = np.array([
+        10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0,
+        20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0
+    ])
+    train_idx = np.arange(24)
+    preds = _fit_predict_in_sample(y, train_idx, np.array([0]), "SeasonalNaive")
+    assert preds[0] == 15.0
+
+
+def test_noi_december_outlier_handling():
+    dates = pd.date_range("2022-01-01", periods=24, freq="MS")
+    actuals = []
+    for d in dates:
+        if d.month == 12:
+            actuals.append(-2000.0)
+        else:
+            actuals.append(-100.0)
+            
+    coverage = pd.DataFrame({
+        "month": dates,
+        "label": [d.strftime("%b %Y") for d in dates],
+        "actual": actuals,
+        "is_missing_filled": False,
+        "dq_flag": "OK",
+        "dq_reason": ""
+    })
+    
+    table = forecast_excel_months(coverage, np.array(actuals), value_col="NOI")
+    
+    assert "outlier_adjustment" in table.columns
+    assert table["outlier_adjustment"].iloc[0] == -2000.0
+    
+    dec_rows = table[table["month"].dt.month == 12]
+    for val in dec_rows["forecast"]:
+        assert val < -1500.0
+        
+    non_dec_rows = table[table["month"].dt.month != 12]
+    for val in non_dec_rows["forecast"]:
+        assert -150.0 < val < -50.0
+

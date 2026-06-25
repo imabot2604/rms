@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 # model by default.
 SEASONAL_REVENUE_METRICS = {"Room_Revenue", "Total_Revenue"}
 
+# FORCE set: these metrics must use SeasonalNaive(12) regardless of other logic
+FORCE_SEASONAL_NAIVE = {"Room_Revenue", "Total_Revenue", "GOP", "FB_Revenue"}
+
 MODEL_SEASONAL_NAIVE = "SeasonalNaive(12)"
 MODEL_ZERO_FILL = "ZeroFill"
 MODEL_SIMPLE_AVERAGE = "SimpleAverage"
@@ -84,6 +87,15 @@ def select_model(metric, history):
     y = np.asarray(history, dtype=float)
     y = y[~np.isnan(y)]
 
+    # Forced seasonal naive metrics
+    if metric in FORCE_SEASONAL_NAIVE:
+        if y.size >= 12:
+            return MODEL_SEASONAL_NAIVE, (
+                f"{metric} is forced to SeasonalNaive(12) for this property class "
+                "to preserve seasonality and avoid flat ARIMA-like behaviour."
+            )
+        return MODEL_LAST_VALUE, "Insufficient history (<12m) for forced seasonality."
+
     if is_near_zero_sparse(y):
         return MODEL_ZERO_FILL, "Near-zero sparse series; zero-fill is appropriate."
 
@@ -106,15 +118,33 @@ def select_model(metric, history):
 def _forecast_one(metric, history, horizon):
     model, rationale = select_model(metric, history)
     y = np.asarray(history, dtype=float)
+    y = y[~np.isnan(y)]
     if model == MODEL_ZERO_FILL:
         preds = np.zeros(horizon)
     elif model == MODEL_SEASONAL_NAIVE:
         preds = _seasonal_naive_forecast(y, horizon, season=12)
     elif model == MODEL_LAST_VALUE:
-        preds = np.full(horizon, y[~np.isnan(y)][-1] if np.any(~np.isnan(y)) else 0.0)
+        preds = np.full(horizon, y[-1] if y.size else 0.0)
     else:  # SimpleAverage
         base = float(np.nanmean(y)) if y.size else 0.0
         preds = np.full(horizon, base)
+
+    # Flat-forecast guard (raise if forecast is suspiciously flat while training
+    # shows significant variability). This detects cases where a model collapsed
+    # seasonality to a near-flat line.
+    if preds.size and y.size:
+        pred_mean = float(np.nanmean(preds))
+        pred_std = float(np.nanstd(preds))
+        hist_mean = float(np.nanmean(np.abs(y))) if np.any(np.abs(y) > 0) else 0.0
+        hist_std = float(np.nanstd(y))
+        pred_rel = (pred_std / pred_mean) if pred_mean != 0 else float('inf')
+        hist_rel = (hist_std / hist_mean) if hist_mean != 0 else 0.0
+        # thresholds per requirements
+        if pred_rel < 0.02 and hist_rel > 0.15:
+            raise ValueError(
+                f"{metric} forecast is suspiciously flat — check training data length and model"
+            )
+
     return preds, model, rationale
 
 
