@@ -130,7 +130,8 @@ async def get_forecast(horizon: int = 6):
 # primary demand driver; the remaining nodes participate in COA reconciliation.
 EXCEL_FORECAST_NODES = [
     "Occupancy_Pct", "ADR", "RevPAR",
-    "Room_Revenue", "FB_Revenue", "Total_Revenue",
+    "Rooms_Sold", "Rooms_Available",
+    "Room_Revenue", "FB_Revenue", "Other_Revenue", "Total_Revenue",
     "Total_UOE", "GOP", "NOI",
 ]
 
@@ -163,14 +164,32 @@ async def get_forecast_excel():
         per_node_tables = {}
         timeline_info = None
         sequence_info = None
+        warnings = []
+        shared_index = None  # the single month index every node aligns to
 
         for node in EXCEL_FORECAST_NODES:
             if node not in df.columns or df[node].isna().all():
+                warnings.append({
+                    "node": node,
+                    "reason": "Not present or not derivable from the uploaded file.",
+                })
                 continue
 
             coverage, timeline, sequence = coverage_frame(df, value_col=node)
             timeline_info = timeline_info or timeline
             sequence_info = sequence_info or sequence
+
+            # Establish/validate a single shared month index across all nodes so
+            # reconciliation never mixes inconsistent in-sample regions.
+            node_index = list(coverage["label"])
+            if shared_index is None:
+                shared_index = node_index
+            elif node_index != shared_index:
+                warnings.append({
+                    "node": node,
+                    "reason": "Month index misaligned with other nodes; skipped from reconciliation.",
+                })
+                continue
 
             # Observed (non-missing) actuals in month order for model selection.
             observed = coverage.loc[~coverage["is_missing_filled"], "actual"].to_numpy(dtype=float)
@@ -182,12 +201,20 @@ async def get_forecast_excel():
         if not per_node_tables:
             raise ValueError("No forecastable numeric nodes found in the uploaded data.")
 
-        # Top-down COA reconciliation so child nodes sum to parent totals.
-        reconciled = reconcile_topdown(node_forecast_arrays, COA_HIERARCHY)
+        # Top-down COA reconciliation on the SHARED, aligned month index.
+        reconciled = reconcile_topdown(
+            node_forecast_arrays, COA_HIERARCHY, month_index=shared_index
+        )
+        recon_errors = reconciliation_error(reconciled, COA_HIERARCHY)
 
         rows = []
+        diagnostics = {"selected_model": {}, "holdout_mape": {}}
         for node, table in per_node_tables.items():
             recon_vals = reconciled.get(node)
+            # Surface per-node model + MAPE in the diagnostic summary.
+            sel_models = [m for m in table["selected_model"].tolist() if m != "none(missing)"]
+            diagnostics["selected_model"][node] = sel_models[0] if sel_models else "none"
+            diagnostics["holdout_mape"][node] = _safe_float(table["holdout_mape"].iloc[0])
             for i in range(len(table)):
                 fc = float(recon_vals[i]) if recon_vals is not None else float(table["forecast"].iloc[i])
                 rows.append({
@@ -213,6 +240,15 @@ async def get_forecast_excel():
                 "expected_labels": sequence_info["labels"],
                 "missing_labels": [m.strftime("%b %Y") for m in sequence_info["missing_months"]],
             },
+            "diagnostics": {
+                "selected_model": diagnostics["selected_model"],
+                "holdout_mape": diagnostics["holdout_mape"],
+                "max_reconciliation_error": _safe_float(recon_errors.get("max")),
+                "reconciliation_error_by_parent": {
+                    k: _safe_float(v) for k, v in recon_errors.items() if k != "max"
+                },
+            },
+            "warnings": warnings,
             "rows": rows,
         }
 
