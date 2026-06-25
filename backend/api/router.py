@@ -179,21 +179,16 @@ async def get_forecast_excel():
         shared_index = None  # the single month index every node aligns to
 
         for node in EXCEL_FORECAST_NODES:
-            is_missing_node = node not in df.columns or df[node].isna().all()
-            if is_missing_node:
+            if node not in df.columns or df[node].isna().all():
                 warnings.append({
                     "node": node,
                     "reason": "Not present or not derivable from the uploaded file.",
                 })
+                continue
 
             coverage, timeline, sequence = coverage_frame(df, value_col=node)
             timeline_info = timeline_info or timeline
             sequence_info = sequence_info or sequence
-
-            if is_missing_node:
-                # Flag every row so the frontend knows this node is entirely synthetic
-                coverage["dq_flag"] = "MISSING_NODE"
-                coverage["dq_reason"] = f"{node} is completely absent from the uploaded data."
 
             # Establish/validate a single shared month index across all nodes so
             # reconciliation never mixes inconsistent in-sample regions.
@@ -216,42 +211,6 @@ async def get_forecast_excel():
 
         if not per_node_tables:
             raise ValueError("No forecastable numeric nodes found in the uploaded data.")
-
-        # Compute child_actual_share * parent_forecast replacements for reconciliation consistency
-        if Store.master_df is not None and not Store.master_df.empty:
-            last_12 = Store.master_df.tail(12)
-            
-            def get_mean_ratio(child_col, parent_col):
-                if child_col not in last_12.columns or parent_col not in last_12.columns:
-                    return 0.0
-                denom = last_12[parent_col].replace(0, np.nan)
-                ratio = (last_12[child_col] / denom).fillna(0)
-                return float(np.mean(ratio))
-                
-            share_room = get_mean_ratio("Room_Revenue", "Total_Revenue")
-            share_fb = get_mean_ratio("FB_Revenue", "Total_Revenue")
-            
-            # Renormalize revenue child shares to sum to 1.0
-            tot_revenue_share = share_room + share_fb
-            if tot_revenue_share > 0:
-                share_room /= tot_revenue_share
-                share_fb /= tot_revenue_share
-            else:
-                share_room = 0.5
-                share_fb = 0.5
-                
-            # Replace forecasts
-            if "Total_Revenue" in node_forecast_arrays:
-                parent_fc = node_forecast_arrays["Total_Revenue"]
-                node_forecast_arrays["Room_Revenue"] = parent_fc * share_room
-                node_forecast_arrays["FB_Revenue"] = parent_fc * share_fb
-                # Set Other_Revenue to 0 so the sum is exactly equal to Total_Revenue
-                node_forecast_arrays["Other_Revenue"] = parent_fc * 0.0
-                
-                # GOP hierarchy: share_uoe = mean(Total_UOE / Total_Revenue)
-                share_uoe = get_mean_ratio("Total_UOE", "Total_Revenue")
-                node_forecast_arrays["Total_UOE"] = parent_fc * share_uoe
-                node_forecast_arrays["GOP"] = parent_fc - node_forecast_arrays["Total_UOE"]
 
         # Top-down COA reconciliation on the SHARED, aligned month index.
         reconciled = reconcile_topdown(
@@ -281,7 +240,6 @@ async def get_forecast_excel():
                     "is_missing_filled": bool(table["is_missing_filled"].iloc[i]),
                     "selected_model": table["selected_model"].iloc[i],
                     "holdout_mape": _safe_float(table["holdout_mape"].iloc[i]),
-                    "outlier_adjustment": _safe_float(table["outlier_adjustment"].iloc[i]) if "outlier_adjustment" in table.columns else 0.0,
                 })
 
         return {
