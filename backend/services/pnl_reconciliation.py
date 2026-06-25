@@ -99,3 +99,34 @@ def hierarchy_residuals(metric_to_values):
 
     errors["max"] = overall
     return errors
+
+
+def validate_reconciliation_inputs(monthly_df, reconciled_future, rounding_tol=1.0):
+    """
+    Validate reconciliation inputs and results.
+
+    - Ensures historical actuals for key financial metrics are present (not all-NaN).
+    - Ensures future Total_Revenue reconciles to children within rounding_tol (absolute dollars).
+
+    Raises HierarchyError on failure.
+    """
+    # 1) Historical actuals presence check.
+    required = ["Room_Revenue", "Total_Revenue", "GOP", "NOI"]
+    for metric in required:
+        if metric in monthly_df.columns:
+            if monthly_df[metric].isna().all():
+                raise HierarchyError(f"Historical actuals missing entirely for {metric}")
+
+    # 2) Future reconciliation tolerance for Total_Revenue.
+    if "Total_Revenue" in reconciled_future:
+        children = [c for c in REVENUE_CHILDREN if c in reconciled_future]
+        if children:
+            child_sum = np.sum([reconciled_future[c] for c in children], axis=0)
+            resid = np.abs(np.asarray(reconciled_future["Total_Revenue"], dtype=float) - child_sum)
+            max_resid = float(np.max(resid)) if resid.size else 0.0
+            if max_resid > rounding_tol:
+                raise HierarchyError(
+                    f"Future Total_Revenue does not reconcile to children within ${rounding_tol}: max residual = {max_resid}"
+                )
+
+    return True
