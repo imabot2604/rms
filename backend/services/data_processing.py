@@ -270,7 +270,7 @@ def process_uploaded_files(files):
 
         # 7. Ensure we have critical columns; try to compute missing ones
         if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df['Date'] = _parse_month_series(df['Date'])
             df = df.dropna(subset=['Date'])
 
         if 'Occupancy_Pct' in df.columns:
@@ -290,6 +290,11 @@ def process_uploaded_files(files):
         # Compute Rooms_Sold if missing but Occupancy and Rooms_Available exist
         if 'Rooms_Sold' not in df.columns and 'Occupancy_Pct' in df.columns and 'Rooms_Available' in df.columns:
             df['Rooms_Sold'] = (df['Occupancy_Pct'] * df['Rooms_Available']).round(0)
+
+        # Derive accounting identities (Total_UOE, Other_Revenue) so the COA
+        # hierarchy reconciles. Built via a single batched concat (no per-column
+        # df.insert fragmentation).
+        df = derive_accounting_identities(df)
 
         dfs.append(df)
 
@@ -311,6 +316,76 @@ def process_uploaded_files(files):
     master_df = engineer_features(master_df)
 
     return master_df
+
+
+def _parse_month_series(series):
+    """
+    Parse month labels deterministically.
+
+    Fairfield/USALI wide files use labels like 'Jan, 2024'. We try a small set
+    of explicit formats first (fast, warning-free, deterministic) and only fall
+    back to generic inference for anything unmatched.
+    """
+    s = series.astype(str).str.strip()
+    result = pd.Series(pd.NaT, index=series.index, dtype='datetime64[ns]')
+
+    explicit_formats = ['%b, %Y', '%b %Y', '%B, %Y', '%B %Y', '%b-%y', '%b-%Y', '%Y-%m', '%m/%Y']
+    for fmt in explicit_formats:
+        mask = result.isna()
+        if not mask.any():
+            break
+        parsed = pd.to_datetime(s[mask], format=fmt, errors='coerce')
+        result[mask] = parsed
+
+    # Single generic fallback for any remaining unparsed labels.
+    mask = result.isna()
+    if mask.any():
+        result[mask] = pd.to_datetime(s[mask], errors='coerce')
+
+    return result
+
+
+def derive_accounting_identities(df):
+    """
+    Derive Total_UOE and Other_Revenue from available accounting identities so
+    the COA hierarchy reconciles even when the source omits these lines.
+
+    Identities used (best-effort, only when inputs exist):
+      * Other_Revenue = Total_Revenue - (Room_Revenue + FB_Revenue)
+      * Total_UOE     = Total_Departmental_Income - GOP
+                        (fallback) Total_Revenue - GOP
+
+    New columns are constructed in a single batched concat to avoid pandas
+    DataFrame fragmentation.
+    """
+    new_cols = {}
+
+    has = lambda c: c in df.columns and not df[c].isna().all()
+
+    # Other_Revenue so Room + F&B + Other == Total_Revenue.
+    if 'Other_Revenue' not in df.columns and has('Total_Revenue'):
+        room = df['Room_Revenue'] if 'Room_Revenue' in df.columns else 0
+        fb = df['FB_Revenue'] if 'FB_Revenue' in df.columns else 0
+        other = pd.to_numeric(df['Total_Revenue'], errors='coerce') \
+            - pd.to_numeric(room, errors='coerce').fillna(0) \
+            - pd.to_numeric(fb, errors='coerce').fillna(0)
+        # Only keep meaningful (non-trivial) residuals.
+        if other.abs().sum(skipna=True) > 1e-6:
+            new_cols['Other_Revenue'] = other
+
+    # Total_UOE fallback derivation so GOP can reconcile.
+    if 'Total_UOE' not in df.columns:
+        if has('Total_Departmental_Income') and has('GOP'):
+            new_cols['Total_UOE'] = pd.to_numeric(df['Total_Departmental_Income'], errors='coerce') \
+                - pd.to_numeric(df['GOP'], errors='coerce')
+        elif has('Total_Revenue') and has('GOP'):
+            new_cols['Total_UOE'] = pd.to_numeric(df['Total_Revenue'], errors='coerce') \
+                - pd.to_numeric(df['GOP'], errors='coerce')
+
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+
+    return df
 
 
 def engineer_features(df):
