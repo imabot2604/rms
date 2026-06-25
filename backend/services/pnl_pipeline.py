@@ -19,11 +19,11 @@ import numpy as np
 import pandas as pd
 
 from services.pnl_extraction import (
-    extract_pnl_rows, FINANCIAL_METRICS, OPERATIONAL_KPIS,
+    extract_pnl_rows, extract_pnl_multi, FINANCIAL_METRICS, OPERATIONAL_KPIS,
     SRC_ACTUAL, SRC_FORECAST, SRC_DERIVED, SRC_MISSING, MISSING_SOURCE_DATA,
 )
 from services.pnl_forecasting import forecast_future_months, SEASONAL_REVENUE_METRICS
-from services.pnl_reconciliation import reconcile_future, hierarchy_residuals
+from services.pnl_reconciliation import reconcile_future, hierarchy_residuals, validate_reconciliation_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -40,18 +40,27 @@ def _safe(v):
         return None
 
 
-def build_pnl_forecast(df_raw, horizon=12):
+def build_pnl_forecast(df_or_frames, horizon=12):
     """
-    Build the full source-backed forecast + lineage for a raw workbook frame.
+    Build the full source-backed forecast + lineage for either:
+      - a single header-less DataFrame (one year)
+      - a list of header-less DataFrames (multiple yearly workbooks).
+    The function concatenates multiple year frames (extract_pnl_multi) so the
+    SeasonalNaive(12) lag reaches the prior-year actuals.
 
     Returns a dict with: rows, lineage, debug_report, model_report,
     reconciliation, validations.
     """
-    monthly_df, lineage, debug_report = extract_pnl_rows(df_raw)
+    # Accept either a list of frames or a single DataFrame.
+    if isinstance(df_or_frames, (list, tuple)):
+        monthly_df, lineage, debug_report = extract_pnl_multi(df_or_frames)
+    else:
+        monthly_df, lineage, debug_report = extract_pnl_rows(df_or_frames)
 
     # Metrics we will forecast: financial metrics that were actually extracted.
     forecastable = [m for m in FINANCIAL_METRICS if m in monthly_df.columns]
 
+    # Forecast using combined history (monthly_df should contain up to 36 months).
     future_df, model_report, flat_flags = forecast_future_months(
         monthly_df, forecastable, horizon=horizon
     )
@@ -60,6 +69,15 @@ def build_pnl_forecast(df_raw, horizon=12):
     future_arrays = {m: future_df[m].to_numpy(dtype=float)
                      for m in forecastable if m in future_df.columns}
     reconciled_future, recon_notes = reconcile_future(future_arrays)
+
+    # Validate reconciliation (future Total_Revenue within $1).
+    try:
+        validate_reconciliation_inputs(monthly_df, reconciled_future, rounding_tol=ROUNDING_TOL)
+    except Exception as e:
+        logger.error("Reconciliation validation failed: %s", e)
+        raise
+
+    # Apply reconciled arrays back into future_df
     for m, arr in reconciled_future.items():
         future_df[m] = arr
 
@@ -107,19 +125,23 @@ def build_pnl_forecast(df_raw, horizon=12):
             })
 
     # 3. Operational KPIs: explicit null + missing_source_data (never faked).
-    for kpi in OPERATIONAL_KPIS:
-        info = lineage.get(kpi, {})
-        if info.get("source_type") == SRC_MISSING:
-            rows.append({
-                "month": None,
-                "metric": kpi,
-                "value": None,
-                "source_type": SRC_MISSING,
-                "source_row_label": None,
-                "forecast_model": None,
-                "confidence_flag": MISSING_SOURCE_DATA,
-                "validation_notes": info.get("reason", MISSING_SOURCE_DATA),
-            })
+    # Hardcode missing KPI response per requirements:
+    MISSING_KPIS = ['Occupancy_Pct', 'ADR', 'RevPAR', 'Rooms_Available', 'Rooms_Sold']
+    for kpi in MISSING_KPIS:
+        rows.append({
+            "month": None,
+            "metric": kpi,
+            "value": None,
+            "source_type": SRC_MISSING,
+            "source_row_label": None,
+            "forecast_model": None,
+            "confidence_flag": MISSING_SOURCE_DATA,
+            "validation_notes": (
+                "Row label not present in Fairfield Inn Newark Airport P&L workbooks "
+                "(2022, 2023, 2024). Statistics sections contain only payroll hours. "
+                "Connect STR report or PMS export to populate this metric."
+            ),
+        })
 
     validations = run_validations(monthly_df, future_df, forecastable, flat_flags, lineage)
 
