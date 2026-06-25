@@ -4,6 +4,8 @@ from services.data_processing import process_uploaded_files, generate_otb_pace
 from services.models import run_ensemble, forecast_excel_months
 from services.excel_timeline import coverage_frame
 from services.reconciliation import reconcile_topdown, reconciliation_error, COA_HIERARCHY
+from services.pnl_pipeline import build_pnl_forecast
+import io
 import logging
 import json
 import numpy as np
@@ -17,6 +19,7 @@ api_router = APIRouter()
 # In-memory store for simulation purposes
 class Store:
     master_df = None
+    raw_workbooks = []  # list of (filename, bytes) for row-label extraction
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -46,6 +49,14 @@ def _safe_float(val):
 @api_router.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
     try:
+        # Capture raw bytes for the row-label (P&L) extraction layer before the
+        # legacy processor consumes the file streams.
+        Store.raw_workbooks = []
+        for f in files:
+            data = await f.read()
+            Store.raw_workbooks.append((getattr(f, "filename", "") or "", data))
+            f.file.seek(0)
+
         # Process and concatenate files
         df = process_uploaded_files(files)
 
@@ -257,3 +268,45 @@ async def get_forecast_excel():
     except Exception as e:
         logger.exception(f"Excel-bound forecast failed: {e}")
         raise HTTPException(status_code=500, detail=f"Forecasting error: {str(e)}")
+
+
+@api_router.get("/forecast_pnl")
+async def get_forecast_pnl(horizon: int = 12):
+    """
+    Source-backed Fairfield/Marriott P&L forecast using ROW-LABEL extraction.
+
+    Historical months are returned as untouched actuals; only months strictly
+    after the last actual are forecast (SeasonalNaive(12) for seasonal revenue).
+    Future parents are recomputed bottom-up from children. Operational KPIs that
+    are absent in the source are returned as null with missing_source_data.
+
+    Each row carries lineage: value, source_type, source_row_label,
+    forecast_model, confidence_flag, validation_notes.
+    """
+    if not Store.raw_workbooks:
+        raise HTTPException(status_code=400,
+                            detail="No workbook uploaded yet. Please upload a P&L file first.")
+    if horizon < 1 or horizon > 36:
+        raise HTTPException(status_code=400, detail="Horizon must be between 1 and 36 months.")
+
+    try:
+        # Read the first workbook as a header-less wide frame.
+        filename, data = Store.raw_workbooks[0]
+        if filename.lower().endswith((".csv", ".txt")):
+            try:
+                df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str)
+                if df_raw.shape[1] <= 1:
+                    df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, sep="\t")
+            except Exception:
+                df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, sep="\t")
+        else:
+            df_raw = pd.read_excel(io.BytesIO(data), header=None, dtype=str)
+
+        result = build_pnl_forecast(df_raw, horizon=horizon)
+        return {"status": "success", "horizon": horizon, **result}
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception(f"P&L forecast failed: {e}")
+        raise HTTPException(status_code=500, detail=f"P&L forecasting error: {str(e)}")
