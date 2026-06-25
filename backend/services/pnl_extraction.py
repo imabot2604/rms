@@ -115,11 +115,14 @@ def normalize_label(label):
     if label is None:
         return ""
     s = str(label).strip().lower()
-    # Strip ='"..."' export wrappers.
+    # Strip ="..." export wrappers.
     if s.startswith('="') and s.endswith('"'):
         s = s[2:-1]
+    # Explicitly remove parentheses and slashes first so aliases like
+    # 'net income (loss)' and 'net income/loss' normalize to the same token.
+    s = s.replace('(', ' ').replace(')', ' ').replace('/', ' ')
     # Replace ampersand/punctuation with spaces (safe), keep alphanumerics.
-    s = re.sub(r"[&/().,:;\"']", " ", s)
+    s = re.sub(r"[&().,:;\"']", " ", s)
     s = re.sub(r"[^a-z0-9%\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -217,7 +220,10 @@ def extract_pnl_rows(df_raw):
     duplicate_candidates = {}     # metric -> [original labels]
     metric_source_label = {}      # metric -> first original label
 
-    for r in range(header_idx + 1, len(df_raw)):
+    # Start scanning labels at the row after the header; enforce at least row
+    # index 7 (0-indexed) per Fairfield workbook convention (row 6 = months).
+    start_row = max(header_idx + 1, 7)
+    for r in range(start_row, len(df_raw)):
         raw_label = df_raw.iat[r, label_col]
         if pd.isna(raw_label) or str(raw_label).strip() == "":
             continue
@@ -298,6 +304,15 @@ def extract_pnl_rows(df_raw):
     }
 
     monthly_df = monthly_df.sort_values("Date").reset_index(drop=True)
+
+    # Validate extraction anchors to fail loudly if the mapping/columns are wrong.
+    try:
+        validate_extraction(monthly_df, debug_report)
+    except Exception:
+        # Print unmatched rows for debugging before re-raising as required.
+        logger.error("Extraction validation failed; unmatched rows: %s", debug_report.get("unmatched_rows"))
+        raise
+
     return monthly_df, lineage, debug_report
 
 
@@ -342,7 +357,7 @@ def extract_pnl_multi(raw_frames):
             duplicate_candidates.setdefault(k, []).extend(v)
 
     combined = pd.concat(per_year, ignore_index=True)
-    combined["Date"] = pd.to_datetime(combined["Date"])
+    combined["Date"] = pd.to_datetime(combined["Date"]) 
     combined = (combined.sort_values("Date")
                 .drop_duplicates(subset=["Date"], keep="first")
                 .reset_index(drop=True))
@@ -356,6 +371,14 @@ def extract_pnl_multi(raw_frames):
         "months_detected": [pd.Timestamp(m).strftime("%b %Y") for m in combined["Date"]],
         "total_months": len(combined),
     }
+
+    # Validate combined extraction anchors as well.
+    try:
+        validate_extraction(combined, debug_report)
+    except Exception:
+        logger.error("Combined extraction validation failed; unmatched rows: %s", debug_report.get("unmatched_rows"))
+        raise
+
     return combined, merged_lineage, debug_report
 
 
