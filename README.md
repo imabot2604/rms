@@ -168,3 +168,67 @@ simple model, deterministic `Jan, 2024` parsing, and the reconciliation
 alignment guardrail. `backend/diagnostics.py` (`diagnostic_summary`) prints the
 selected model per node, holdout MAPE, and maximum reconciliation error,
 mirroring the train-on-history / validate workflow from the diagnostic report.
+
+## Source-backed P&L pipeline (row-label architecture)
+
+### Root cause
+
+Fairfield Inn / Marriott monthly P&L workbooks are organized by **row labels**
+(e.g. `Total Room Department Revenue`, `Total Operating Revenue`,
+`Gross Operating Profit`, `Net Income loss`) with **months as columns**. The
+legacy detection expected operational KPIs (Occupancy, ADR, RevPAR, Rooms Sold,
+Rooms Available) as column headers, which do not exist in these files. The
+source-backed pipeline scans the first label column and maps canonical metrics
+from row names instead. It is exposed via `GET /api/forecast_pnl` and is
+additive (the existing `/forecast` and `/forecast_excel` endpoints are intact).
+
+### Layers
+
+1. **Extraction** (`services/pnl_extraction.py`) -- `extract_pnl_rows()` scans
+   the label column, fuzzy-normalizes labels (trim, lowercase, collapse spaces,
+   safe punctuation removal) for matching, and maps them via the explicit
+   `CANONICAL_ROW_MAP`. The original label is preserved for lineage. Returns a
+   monthly dataframe plus a debug report (matched / unmatched / duplicate
+   candidate rows and missing requested metrics).
+2. **Mapping** -- canonical row map with alias support:
+   `Room_Revenue <- Total Room Department Revenue`,
+   `FB_Revenue <- Total FB and Minor Operating Dept Revenue`,
+   `Total_Revenue <- Total Operating Revenue`,
+   `GOP <- Gross Operating Profit`,
+   `NOI <- Net Income loss` (canonical name; original label kept in metadata),
+   `Total_UOE` derived as `Total_Revenue - GOP` only when no explicit UOE row
+   exists.
+3. **Forecasting** (`services/pnl_forecasting.py`) -- forecasts ONLY months
+   strictly after the last actual. `Room_Revenue` and `Total_Revenue` default
+   to **SeasonalNaive(12)** so seasonal series never collapse to a flat line
+   (ARIMA is explicitly excluded for these). True near-zero sparse series use
+   zero-fill. A per-metric model-selection report records the rationale.
+4. **Reconciliation** (`services/pnl_reconciliation.py`) -- historical actuals
+   are untouched; future months are reconciled **bottom-up**
+   (`Total_Revenue = Room + FB + Other`, `GOP = Total_Revenue - Total_UOE`).
+   `NOI` keeps its own source-backed forecast and is **not** forced to equal
+   GOP. No blind scale factors across mismatched model ranges.
+
+### Honest missing KPIs
+
+Operational KPIs absent from the source return explicit `null` with status
+`missing_source_data` and the reason "not present in source workbook. I could
+not verify those KPI labels in the attached files." They are never fabricated
+from revenue.
+
+### Metric lineage
+
+Every output row carries: `value`, `source_type` (`actual` / `forecast` /
+`derived` / `missing`), `source_row_label`, `forecast_model`,
+`confidence_flag`, and `validation_notes`.
+
+### Validations (`services/pnl_pipeline.run_validations`)
+
+- historical actuals are present and unmodified (match source within rounding
+  tolerance),
+- future-period hierarchy equations reconcile within tolerance,
+- flat forecast on a historically seasonal series is flagged,
+- impossible KPI values are flagged if/when KPIs become available
+  (occupancy outside 0-100%, ADR < 0, RevPAR < 0).
+
+Tests live in `backend/tests/test_pnl_pipeline.py`.
