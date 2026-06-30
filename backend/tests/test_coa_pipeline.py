@@ -1,9 +1,8 @@
 """
-Regression tests for the full Chart-of-Accounts (COA) pipeline.
+Regression tests for the generic COA hierarchy extraction + forecasting.
 
-Mirrors the spirit of ``test_pnl_pipeline.py`` but exercises the wider
-``coa_extraction`` + ``coa_forecasting`` modules end-to-end on a synthetic
-Fairfield-style workbook.
+Uses a small synthetic workbook with a known, verifiable rollup structure
+(rather than property-specific fixtures) so it stays valid for any property.
 """
 
 import os
@@ -12,137 +11,153 @@ import sys
 import numpy as np
 import pandas as pd
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from services.coa_extraction import (
-    extract_coa_rows,
-    extract_coa_multi,
-    coa_wide,
-)
-from services.coa_forecasting import (
-    forecast_coa,
-    build_coa_rows,
-)
+from services.coa_extraction import extract_coa_tree  # noqa: E402
+from services.coa_forecasting import forecast_coa_tree, reconciliation_diagnostics  # noqa: E402
 
 
-def _build_synthetic_workbook(year: int) -> pd.DataFrame:
+def _synthetic_workbook():
     """
-    Build a header-less wide frame that mimics the Fairfield row-label layout
-    used in the rest of the test suite.
+    Two leaf GL accounts roll up into a department total, which itself rolls
+    up into a higher-level total -- mirrors the real shape (GL leaf ->
+    department subtotal -> Total Operating Revenue) without being tied to
+    any specific property's wording.
     """
-    months = [pd.Timestamp(year=year, month=m, day=1) for m in range(1, 13)]
-    header = ["Account"] + [d.strftime("%b, %Y") for d in months]
+    months = [pd.Timestamp(2023, 1, 1) + pd.DateOffset(months=i) for i in range(12)]
+    month_labels = [m.strftime("%b, %Y") for m in months]
+
+    leaf_a = [1000.0 + 50 * i for i in range(12)]
+    leaf_b = [500.0 + 20 * i for i in range(12)]
+    dept_total = [leaf_a[i] + leaf_b[i] for i in range(12)]
+    other_dept = [300.0 + 10 * i for i in range(12)]
+    grand_total = [dept_total[i] + other_dept[i] for i in range(12)]
 
     rows = [
-        [""] * 13,                                   # spacer
-        [""] * 13,                                   # spacer
-        [""] * 13,                                   # spacer
-        [""] * 13,                                   # spacer
-        [""] * 13,                                   # spacer
-        [""] * 13,                                   # spacer
-        header,                                      # row 6: months
-        ["Room Department Revenue"] + [""] * 12,     # section heading
-        ["Total Room Department Revenue"] + [
-            float(200_000 + 30_000 * np.sin(m / 12 * 2 * np.pi) + 1_000 * m)
-            for m in range(12)
-        ],
-        ["Total FB and Minor Operating Dept Revenue"] + [
-            float(15_000 + 2_000 * np.sin(m / 12 * 2 * np.pi))
-            for m in range(12)
-        ],
-        ["Total Operating Revenue"] + [""] * 12,     # placeholder, recomputed below
-        ["Total Departmental Expenses"] + [
-            float(60_000 + 5_000 * np.sin(m / 12 * 2 * np.pi))
-            for m in range(12)
-        ],
-        ["Gross Operating Profit"] + [""] * 12,
-        ["Net Income loss"] + [
-            float(40_000 + 8_000 * np.sin(m / 12 * 2 * np.pi))
-            for m in range(12)
-        ],
-        ["Marketing"] + [float(7_000)] * 12,           # near-constant leaf
-        ["Bad Debt Expense"] + [0.0] * 12,             # sparse / zero
+        [""] + month_labels,
+        ["40010.000 . Account A"] + [str(v) for v in leaf_a],
+        ["40020.000 . Account B"] + [str(v) for v in leaf_b],
+        ["Total Room Department Revenue"] + [str(v) for v in dept_total],
+        ["Total Other Revenue"] + [str(v) for v in other_dept],
+        ["Total Operating Revenue"] + [str(v) for v in grand_total],
     ]
-
-    df = pd.DataFrame(rows)
-
-    room_idx = 8
-    fb_idx = 9
-    tot_idx = 10
-    gop_idx = 12
-    for c in range(1, 13):
-        room = float(df.iat[room_idx, c])
-        fb = float(df.iat[fb_idx, c])
-        df.iat[tot_idx, c] = room + fb
-        df.iat[gop_idx, c] = (room + fb) - float(df.iat[11, c])
-    return df.astype(object)
+    return pd.DataFrame(rows), {
+        "leaf_a": leaf_a, "leaf_b": leaf_b, "dept_total": dept_total,
+        "other_dept": other_dept, "grand_total": grand_total,
+    }
 
 
-def test_extract_coa_rows_finds_sections_and_leaves():
-    raw = _build_synthetic_workbook(2024)
-    long_df, dbg = extract_coa_rows(raw)
-    assert not long_df.empty
-    assert dbg["leaf_count"] >= 6
-    leaf_accounts = set(long_df.loc[~long_df["is_section"], "account"])
-    assert "Total Room Department Revenue" in leaf_accounts
-    assert "Net Income loss" in leaf_accounts
-    assert "Marketing" in leaf_accounts
+def test_hierarchy_reconstructed_from_numbers():
+    raw, truth = _synthetic_workbook()
+    nodes, roots, months, debug = extract_coa_tree(raw)
+    assert debug["value_row_count"] == 5
+
+    dept = next(n for n in nodes.values() if n.label == "Total Room Department Revenue")
+    assert dept.rollup_verified
+    assert {c.label for c in dept.children} == {"40010.000 . Account A", "40020.000 . Account B"}
+
+    grand = next(n for n in nodes.values() if n.label == "Total Operating Revenue")
+    assert grand.rollup_verified
+    assert {c.label for c in grand.children} == {"Total Room Department Revenue", "Total Other Revenue"}
 
 
-def test_extract_coa_multi_dedups_across_years():
-    f1 = _build_synthetic_workbook(2023)
-    f2 = _build_synthetic_workbook(2024)
-    combined, dbg = extract_coa_multi([f1, f2])
-    assert dbg["total_accounts"] > 0
-    months = sorted(combined["Date"].dt.strftime("%Y-%m").unique())
-    assert months[0].startswith("2023-")
-    assert any(m.startswith("2024-") for m in months)
-    assert combined.duplicated(subset=["account", "Date"]).sum() == 0
+def test_leaf_actuals_match_source():
+    raw, truth = _synthetic_workbook()
+    nodes, roots, months, debug = extract_coa_tree(raw)
+    leaf_a = next(n for n in nodes.values() if n.label == "40010.000 . Account A")
+    assert np.allclose(leaf_a.values, truth["leaf_a"], atol=0.01)
 
 
-def test_coa_wide_pivots_excluding_sections():
-    raw = _build_synthetic_workbook(2024)
-    long_df, _ = extract_coa_rows(raw)
-    wide = coa_wide(long_df)
-    assert "Total Room Department Revenue" in wide.columns
-    assert wide.shape[0] == 12
-    assert wide["Total Room Department Revenue"].notna().all()
+def test_rollups_reconcile_exactly():
+    raw, truth = _synthetic_workbook()
+    nodes, roots, months, debug = extract_coa_tree(raw)
+    recon = reconciliation_diagnostics(nodes)
+    assert len(recon) == 2  # two verified rollups: dept total and grand total
+    assert all((d["max_residual"] or 0.0) < 1e-6 for d in recon)
 
 
-def test_forecast_coa_future_only_and_models():
-    f1 = _build_synthetic_workbook(2023)
-    f2 = _build_synthetic_workbook(2024)
-    combined, _ = extract_coa_multi([f1, f2])
-    wide = coa_wide(combined)
-    future_df, model_report, flags = forecast_coa(wide, horizon=6)
+def test_fitted_has_no_leakage_and_forecast_is_populated():
+    raw, truth = _synthetic_workbook()
+    nodes, roots, months, debug = extract_coa_tree(raw)
+    rows = forecast_coa_tree(nodes, roots, months, horizon=3)
 
-    assert len(future_df) == 6
-    last_actual = wide.index.max()
-    assert (pd.to_datetime(future_df["Date"]) > last_actual).all()
+    leaf_a_rows = [r for r in rows if r["label"] == "40010.000 . Account A"]
+    historical = [r for r in leaf_a_rows if r["period"] == "historical"]
+    future = [r for r in leaf_a_rows if r["period"] == "future"]
 
-    rev_model = model_report["Total Room Department Revenue"]["model"]
-    assert rev_model == "SeasonalNaive(12)"
+    assert len(historical) == 12
+    assert len(future) == 3
+    # First month can never be fitted (no prior data).
+    assert historical[0]["fitted"] is None
+    # Later months ARE fitted.
+    assert historical[-1]["fitted"] is not None
+    # Future months have a forecast and no actual.
+    assert all(r["forecast"] is not None and r["actual"] is None for r in future)
 
-    bad_debt_model = model_report["Bad Debt Expense"]["model"]
-    assert bad_debt_model == "ZeroFill"
-    assert (future_df["Bad Debt Expense"].to_numpy() == 0).all()
+
+def test_parent_forecast_equals_sum_of_children_forecast():
+    raw, truth = _synthetic_workbook()
+    nodes, roots, months, debug = extract_coa_tree(raw)
+    rows = forecast_coa_tree(nodes, roots, months, horizon=3)
+
+    dept = next(n for n in nodes.values() if n.label == "Total Room Department Revenue")
+    parent_future = [r["forecast"] for r in rows
+                      if r["node_id"] == dept.id and r["period"] == "future"]
+    child_sum_future = np.sum(
+        [[r["forecast"] for r in rows if r["node_id"] == c.id and r["period"] == "future"]
+         for c in dept.children],
+        axis=0,
+    )
+    assert np.allclose(parent_future, child_sum_future, atol=1e-6)
 
 
-def test_build_coa_rows_emits_lineage():
-    raw = _build_synthetic_workbook(2024)
-    long_df, _ = extract_coa_rows(raw)
-    wide = coa_wide(long_df)
-    future_df, model_report, flags = forecast_coa(wide, horizon=3)
-    section_lookup = (long_df[~long_df["is_section"]]
-                      .drop_duplicates("account")
-                      .set_index("account")["section"].to_dict())
-    rows = build_coa_rows(wide, future_df, model_report, flags, section_lookup)
-    actual_rows = [r for r in rows if r["source_type"] == "actual"]
-    forecast_rows = [r for r in rows if r["source_type"] == "forecast"]
-    assert actual_rows and forecast_rows
-    sample = forecast_rows[0]
-    for key in ("month", "account", "value", "source_type",
-                "forecast_model", "confidence_flag", "validation_notes"):
-        assert key in sample
+def _synthetic_two_year_workbook_with_label_collision(year):
+    """
+    Reproduces the real-world bug found against this property's actual
+    2023/2024/2025 workbooks: TWO unrelated root-level rows share the exact
+    same label ("Total Departmental Expenses") within a single year -- one
+    is a verified rollup of a small department-level summary, the other is
+    an unrelated, much larger total elsewhere in the same sheet that does
+    NOT roll up from anything nearby. A naive label-only join across years
+    must not let the second occurrence silently overwrite the first.
+    """
+    months = [pd.Timestamp(year, 1, 1) + pd.DateOffset(months=i) for i in range(12)]
+    month_labels = [m.strftime("%b, %Y") for m in months]
+
+    room = [200.0 + 5 * year + i for i in range(12)]
+    fb = [100.0 + 2 * year + i for i in range(12)]
+    dept_total = [room[i] + fb[i] for i in range(12)]
+    unrelated_total = [9000.0 + 50 * year + i for i in range(12)]  # does NOT equal any nearby sum
+
+    rows = [
+        [""] + month_labels,
+        ["Room Department"] + [str(v) for v in room],
+        ["Food and Beverages Department"] + [str(v) for v in fb],
+        ["Total Departmental Expenses"] + [str(v) for v in dept_total],
+        ["Unrelated Section Header"] + ["" for _ in range(12)],
+        ["Total Departmental Expenses"] + [str(v) for v in unrelated_total],
+    ]
+    return pd.DataFrame(rows), {"dept_total": dept_total, "unrelated_total": unrelated_total}
+
+
+def test_multi_year_label_collision_does_not_overwrite():
+    from services.coa_extraction import extract_coa_tree_multi
+
+    raw_2023, truth_2023 = _synthetic_two_year_workbook_with_label_collision(2023)
+    raw_2024, truth_2024 = _synthetic_two_year_workbook_with_label_collision(2024)
+
+    nodes, roots, months, debug = extract_coa_tree_multi([raw_2023, raw_2024])
+
+    first = nodes[("total departmental expenses",)]
+    second = nodes[("total departmental expenses", "__occurrence_2")]
+
+    assert len(first.children) == 2  # the verified rollup keeps its children
+    assert len(second.children) == 0  # the unrelated total stays unverified, not merged in
+
+    assert np.allclose(first.values[:12], truth_2023["dept_total"], atol=0.01)
+    assert np.allclose(second.values[:12], truth_2023["unrelated_total"], atol=0.01)
+    assert np.allclose(first.values[12:], truth_2024["dept_total"], atol=0.01)
+    assert np.allclose(second.values[12:], truth_2024["unrelated_total"], atol=0.01)
+
+    # The collision must be reported, not silently absorbed.
+    assert len(debug["label_collisions"]) >= 2  # one per year
