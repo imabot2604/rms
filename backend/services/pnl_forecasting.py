@@ -129,9 +129,15 @@ def _forecast_one(metric, history, horizon):
         base = float(np.nanmean(y)) if y.size else 0.0
         preds = np.full(horizon, base)
 
-    # Flat-forecast guard (raise if forecast is suspiciously flat while training
-    # shows significant variability). This detects cases where a model collapsed
-    # seasonality to a near-flat line.
+    # Flat-forecast detector: SimpleAverage and LastValue are flat BY
+    # DEFINITION whenever the underlying series isn't seasonal, so this is
+    # expected, not an error condition. Surface it as a non-fatal flag (so the
+    # caller can mark the forecast low-confidence) instead of raising -- a
+    # hard raise here previously killed the ENTIRE pipeline for any metric
+    # with too little history for seasonal detection (<24 months), which is
+    # the common case, not the exception (e.g. it crashed every run for the
+    # uploaded "Test Hospitality" workbook, which has exactly 12 months).
+    is_flat = False
     if preds.size and y.size:
         pred_mean = float(np.nanmean(preds))
         pred_std = float(np.nanstd(preds))
@@ -139,13 +145,78 @@ def _forecast_one(metric, history, horizon):
         hist_std = float(np.nanstd(y))
         pred_rel = (pred_std / pred_mean) if pred_mean != 0 else float('inf')
         hist_rel = (hist_std / hist_mean) if hist_mean != 0 else 0.0
-        # thresholds per requirements
         if pred_rel < 0.02 and hist_rel > 0.15:
-            raise ValueError(
-                f"{metric} forecast is suspiciously flat — check training data length and model"
-            )
+            is_flat = True
 
-    return preds, model, rationale
+    return preds, model, rationale, is_flat
+
+
+def fit_in_sample(metric, history):
+    """
+    Produce a leakage-safe FITTED value for every available (historical)
+    month, so available months can be compared model-vs-actual the same way
+    future months are -- not just echoed back as bare actuals.
+
+    For month i, the fitted value uses ONLY data strictly before i (an
+    expanding-window estimate), or the same-month-prior-year actual once 12
+    months of history exist and the metric is seasonal/forced-seasonal. The
+    first month can never be fitted (no prior data) and is returned as NaN --
+    that is a real, honest limitation, not a bug to paper over.
+
+    Returns (fitted: np.ndarray same length as history, model: str).
+    """
+    y = np.asarray(history, dtype=float)
+    n = y.size
+    fitted = np.full(n, np.nan)
+    if n == 0:
+        return fitted, MODEL_LAST_VALUE
+
+    clean = y[~np.isnan(y)]
+    if is_near_zero_sparse(clean):
+        fitted[:] = 0.0
+        fitted[np.isnan(y)] = np.nan
+        return fitted, MODEL_ZERO_FILL
+
+    use_seasonal = metric in FORCE_SEASONAL_NAIVE or is_seasonal(clean)
+    model = MODEL_SEASONAL_NAIVE if use_seasonal else MODEL_SIMPLE_AVERAGE
+
+    for i in range(n):
+        if i == 0:
+            continue  # no prior data to fit on -- left as NaN, by design
+        if use_seasonal and i >= 12 and not np.isnan(y[i - 12]):
+            fitted[i] = y[i - 12]
+        else:
+            prior = y[:i]
+            prior = prior[~np.isnan(prior)]
+            if prior.size:
+                fitted[i] = float(np.mean(prior))
+    return fitted, model
+
+
+def forecast_available_months(monthly_df, metrics):
+    """
+    Companion to forecast_future_months: instead of months strictly after the
+    last actual, this produces a FITTED value for each month that already has
+    an actual, using fit_in_sample (no leakage -- each month's fitted value
+    only looks at strictly earlier months).
+
+    Returns (fitted_df, model_report) where fitted_df has 'Date' + one fitted
+    column per metric, aligned 1:1 with monthly_df's rows.
+    """
+    if "Date" not in monthly_df.columns or monthly_df.empty:
+        raise ValueError("monthly_df must contain a non-empty 'Date' column.")
+
+    out = {"Date": list(monthly_df["Date"])}
+    model_report = {}
+    for metric in metrics:
+        if metric not in monthly_df.columns:
+            continue
+        history = monthly_df[metric].to_numpy(dtype=float)
+        fitted, model = fit_in_sample(metric, history)
+        out[metric] = fitted
+        model_report[metric] = model
+
+    return pd.DataFrame(out), model_report
 
 
 def forecast_future_months(monthly_df, metrics, horizon=12):
@@ -179,7 +250,7 @@ def forecast_future_months(monthly_df, metrics, horizon=12):
         if metric not in monthly_df.columns:
             continue
         history = monthly_df[metric].to_numpy(dtype=float)
-        preds, model, rationale = _forecast_one(metric, history, horizon)
+        preds, model, rationale, is_flat = _forecast_one(metric, history, horizon)
         out[metric] = preds
         model_report[metric] = {"model": model, "rationale": rationale}
 
@@ -192,18 +263,16 @@ def forecast_future_months(monthly_df, metrics, horizon=12):
                     "flag": "FLAT_FORECAST_ON_SEASONAL_SERIES",
                     "detail": "Forecast is flat but history is seasonal.",
                 })
+        elif is_flat:
+            flags.append({
+                "metric": metric,
+                "flag": "FLAT_FORECAST_LOW_CONFIDENCE",
+                "detail": (
+                    f"{model} produced a flat forecast while {metric}'s history is "
+                    "variable. Usually means there isn't enough history yet for "
+                    "seasonal detection (needs 24+ months); not a hard error."
+                ),
+            })
 
     future_df = pd.DataFrame(out)
     return future_df, model_report, flags
-
-
-
-def forecast_coa_future(wide_df, horizon=12):
-    """COA-wide convenience wrapper around coa_forecasting.forecast_coa.
-
-    Lets callers that already depend on pnl_forecasting reach the
-    per-account COA forecaster without importing a second module. Imported
-    lazily to avoid an import cycle.
-    """
-    from services.coa_forecasting import forecast_coa
-    return forecast_coa(wide_df, horizon=horizon)
