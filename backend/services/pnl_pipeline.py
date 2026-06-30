@@ -213,3 +213,50 @@ def run_validations(monthly_df, future_df, metrics, flat_flags, lineage):
     results["all_passed"] = all(v.get("passed", False) for v in results.values()
                                 if isinstance(v, dict))
     return results
+
+
+
+def build_coa_forecast(df_or_frames, horizon=12):
+    """Build the full Chart-of-Accounts forecast (every leaf account).
+
+    Mirrors build_pnl_forecast but uses coa_extraction /
+    coa_forecasting so every account row in the workbook is forecast
+    individually. Historical actuals are returned untouched and lineage is
+    preserved per (account, month).
+
+    Returns dict with: rows, debug_report, model_report, last_actual_month,
+    accounts.
+    """
+    from services.coa_extraction import extract_coa_rows, extract_coa_multi, coa_wide
+    from services.coa_forecasting import forecast_coa, build_coa_rows
+
+    if isinstance(df_or_frames, (list, tuple)):
+        long_df, debug_report = extract_coa_multi(df_or_frames)
+    else:
+        long_df, debug_report = extract_coa_rows(df_or_frames)
+
+    wide = coa_wide(long_df)
+    if wide.empty:
+        return {
+            "rows": [],
+            "debug_report": debug_report,
+            "model_report": {},
+            "last_actual_month": None,
+            "accounts": [],
+        }
+
+    future_df, model_report, flags = forecast_coa(wide, horizon=horizon)
+
+    section_lookup = (long_df[~long_df["is_section"].astype(bool)]
+                      .drop_duplicates("account")
+                      .set_index("account")["section"].to_dict())
+    rows = build_coa_rows(wide, future_df, model_report, flags, section_lookup)
+
+    return {
+        "rows": rows,
+        "debug_report": debug_report,
+        "model_report": model_report,
+        "flags": flags,
+        "last_actual_month": pd.Timestamp(wide.index.max()).strftime("%b %Y"),
+        "accounts": list(wide.columns),
+    }

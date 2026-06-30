@@ -4,7 +4,7 @@ from services.data_processing import process_uploaded_files, generate_otb_pace
 from services.models import run_ensemble, forecast_excel_months
 from services.excel_timeline import coverage_frame
 from services.reconciliation import reconcile_topdown, reconciliation_error, COA_HIERARCHY
-from services.pnl_pipeline import build_pnl_forecast
+from services.pnl_pipeline import build_pnl_forecast, build_coa_forecast
 import io
 import logging
 import json
@@ -310,3 +310,46 @@ async def get_forecast_pnl(horizon: int = 12):
     except Exception as e:
         logger.exception(f"P&L forecast failed: {e}")
         raise HTTPException(status_code=500, detail=f"P&L forecasting error: {str(e)}")
+
+
+
+@api_router.get("/forecast_coa")
+async def get_forecast_coa(horizon: int = 12):
+    """
+    Full Chart-of-Accounts forecast.
+
+    Extracts every account row from the uploaded workbook(s) and forecasts
+    each leaf individually (SeasonalNaive for seasonal lines, zero-fill for
+    sparse, simple average otherwise). Historical months are returned as
+    untouched actuals; only future months are forecast. Per-row lineage
+    (value, source_type, forecast_model, confidence_flag, validation_notes,
+    section) is preserved.
+    """
+    if not Store.raw_workbooks:
+        raise HTTPException(status_code=400,
+                            detail="No workbook uploaded yet. Please upload a P&L file first.")
+    if horizon < 1 or horizon > 36:
+        raise HTTPException(status_code=400, detail="Horizon must be between 1 and 36 months.")
+
+    try:
+        frames = []
+        for filename, data in Store.raw_workbooks:
+            if filename.lower().endswith((".csv", ".txt")):
+                try:
+                    df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str)
+                    if df_raw.shape[1] <= 1:
+                        df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, sep="\t")
+                except Exception:
+                    df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, sep="\t")
+            else:
+                df_raw = pd.read_excel(io.BytesIO(data), header=None, dtype=str)
+            frames.append(df_raw)
+
+        result = build_coa_forecast(frames if len(frames) > 1 else frames[0], horizon=horizon)
+        return {"status": "success", "horizon": horizon, **result}
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception(f"COA forecast failed: {e}")
+        raise HTTPException(status_code=500, detail=f"COA forecasting error: {str(e)}")

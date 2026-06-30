@@ -417,3 +417,16 @@ def validate_extraction(monthly_df, debug_report=None, anchors=None):
             + f". Unmatched rows: {unmatched}"
         )
     return True
+
+
+
+# --- COA-aware helper (added alongside the canonical row-label extraction) ---
+def extract_all_rows(df_raw):
+    """Convenience wrapper: defer to coa_extraction.extract_coa_rows.
+
+    Kept on pnl_extraction so existing callers can reach the full-COA
+    grid without importing a second module. Imported lazily to avoid an
+    import cycle (coa_extraction itself imports from this module).
+    """
+    from services.coa_extraction import extract_coa_rows
+    return extract_coa_rows(df_raw)

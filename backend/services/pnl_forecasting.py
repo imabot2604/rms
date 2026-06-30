@@ -195,3 +195,15 @@ def forecast_future_months(monthly_df, metrics, horizon=12):
 
     future_df = pd.DataFrame(out)
     return future_df, model_report, flags
+
+
+
+def forecast_coa_future(wide_df, horizon=12):
+    """COA-wide convenience wrapper around coa_forecasting.forecast_coa.
+
+    Lets callers that already depend on pnl_forecasting reach the
+    per-account COA forecaster without importing a second module. Imported
+    lazily to avoid an import cycle.
+    """
+    from services.coa_forecasting import forecast_coa
+    return forecast_coa(wide_df, horizon=horizon)
