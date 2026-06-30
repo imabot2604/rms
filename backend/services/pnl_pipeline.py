@@ -22,7 +22,9 @@ from services.pnl_extraction import (
     extract_pnl_rows, extract_pnl_multi, FINANCIAL_METRICS, OPERATIONAL_KPIS,
     SRC_ACTUAL, SRC_FORECAST, SRC_DERIVED, SRC_MISSING, MISSING_SOURCE_DATA,
 )
-from services.pnl_forecasting import forecast_future_months, SEASONAL_REVENUE_METRICS
+from services.pnl_forecasting import (
+    forecast_future_months, forecast_available_months, SEASONAL_REVENUE_METRICS,
+)
 from services.pnl_reconciliation import reconcile_future, hierarchy_residuals, validate_reconciliation_inputs
 
 logger = logging.getLogger(__name__)
@@ -81,23 +83,34 @@ def build_pnl_forecast(df_or_frames, horizon=12):
     for m, arr in reconciled_future.items():
         future_df[m] = arr
 
+    # Fitted values for AVAILABLE (historical) months -- this was previously
+    # entirely absent: historical rows carried only the bare actual with
+    # forecast_model=None, so there was no way to see model performance on
+    # the months that already have data, only on the future horizon.
+    fitted_df, fitted_model_report = forecast_available_months(monthly_df, forecastable)
+
     rows = []
 
-    # 1. Historical actual rows (untouched source values).
-    for _, r in monthly_df.iterrows():
+    # 1. Historical rows: actual value (untouched) + a leakage-safe fitted
+    #    value for comparison. The very first month in the series can never
+    #    be fitted (no prior data exists) and is reported as None rather than
+    #    silently fabricated.
+    for idx, r in monthly_df.reset_index(drop=True).iterrows():
         month_label = pd.Timestamp(r["Date"]).strftime("%b %Y")
         for metric in forecastable:
             val = r.get(metric)
             src = lineage.get(metric, {}).get("source_type", SRC_ACTUAL)
+            fitted_val = fitted_df[metric].iloc[idx] if metric in fitted_df.columns else None
             rows.append({
                 "month": month_label,
                 "metric": metric,
                 "value": _safe(val),
+                "fitted_value": _safe(fitted_val),
                 "source_type": SRC_DERIVED if src == SRC_DERIVED else SRC_ACTUAL,
                 "source_row_label": lineage.get(metric, {}).get("source_row_label"),
-                "forecast_model": None,
+                "forecast_model": fitted_model_report.get(metric) if fitted_val is not None and not pd.isna(fitted_val) else None,
                 "confidence_flag": "high" if src == SRC_ACTUAL else "derived",
-                "validation_notes": "",
+                "validation_notes": "" if idx > 0 else "First month in series: no prior data to fit against.",
             })
 
     # 2. Future forecast rows.
@@ -125,9 +138,10 @@ def build_pnl_forecast(df_or_frames, horizon=12):
             })
 
     # 3. Operational KPIs: explicit null + missing_source_data (never faked).
-    # Hardcode missing KPI response per requirements:
     MISSING_KPIS = ['Occupancy_Pct', 'ADR', 'RevPAR', 'Rooms_Available', 'Rooms_Sold']
     for kpi in MISSING_KPIS:
+        if kpi in lineage and lineage[kpi].get("status") != MISSING_SOURCE_DATA:
+            continue
         rows.append({
             "month": None,
             "metric": kpi,
@@ -137,9 +151,8 @@ def build_pnl_forecast(df_or_frames, horizon=12):
             "forecast_model": None,
             "confidence_flag": MISSING_SOURCE_DATA,
             "validation_notes": (
-                "Row label not present in Fairfield Inn Newark Airport P&L workbooks "
-                "(2022, 2023, 2024). Statistics sections contain only payroll hours. "
-                "Connect STR report or PMS export to populate this metric."
+                "Row label not present in the uploaded workbook. "
+                "Connect an STR report or PMS export to populate this metric."
             ),
         })
 
@@ -155,7 +168,7 @@ def build_pnl_forecast(df_or_frames, horizon=12):
             "future_residuals": hierarchy_residuals(reconciled_future),
         },
         "validations": validations,
-        "last_actual_month": pd.Timestamp(monthly_df["Date"]).max().strftime("%b %Y")
+        "last_actual_month": monthly_df["Date"].max().strftime("%b %Y")
         if not monthly_df.empty else None,
     }
 
@@ -189,10 +202,18 @@ def run_validations(monthly_df, future_df, metrics, flat_flags, lineage):
         "detail": resid,
     }
 
-    # 3. No flat forecast on a historically seasonal series.
+    # 3. No flat forecast on a historically seasonal series. The low-confidence
+    #    flat flag (insufficient history for seasonal detection) is reported
+    #    separately and does not fail this gate.
+    hard_flat = [f for f in flat_flags if f.get("flag") == "FLAT_FORECAST_ON_SEASONAL_SERIES"]
+    soft_flat = [f for f in flat_flags if f.get("flag") == "FLAT_FORECAST_LOW_CONFIDENCE"]
     results["no_flat_seasonal_forecast"] = {
-        "passed": len(flat_flags) == 0,
-        "detail": flat_flags,
+        "passed": len(hard_flat) == 0,
+        "detail": hard_flat,
+    }
+    results["flat_forecast_low_confidence"] = {
+        "passed": True,
+        "detail": soft_flat,
     }
 
     # 4. Impossible KPI checks (only when KPIs are present in source).
@@ -213,50 +234,3 @@ def run_validations(monthly_df, future_df, metrics, flat_flags, lineage):
     results["all_passed"] = all(v.get("passed", False) for v in results.values()
                                 if isinstance(v, dict))
     return results
-
-
-
-def build_coa_forecast(df_or_frames, horizon=12):
-    """Build the full Chart-of-Accounts forecast (every leaf account).
-
-    Mirrors build_pnl_forecast but uses coa_extraction /
-    coa_forecasting so every account row in the workbook is forecast
-    individually. Historical actuals are returned untouched and lineage is
-    preserved per (account, month).
-
-    Returns dict with: rows, debug_report, model_report, last_actual_month,
-    accounts.
-    """
-    from services.coa_extraction import extract_coa_rows, extract_coa_multi, coa_wide
-    from services.coa_forecasting import forecast_coa, build_coa_rows
-
-    if isinstance(df_or_frames, (list, tuple)):
-        long_df, debug_report = extract_coa_multi(df_or_frames)
-    else:
-        long_df, debug_report = extract_coa_rows(df_or_frames)
-
-    wide = coa_wide(long_df)
-    if wide.empty:
-        return {
-            "rows": [],
-            "debug_report": debug_report,
-            "model_report": {},
-            "last_actual_month": None,
-            "accounts": [],
-        }
-
-    future_df, model_report, flags = forecast_coa(wide, horizon=horizon)
-
-    section_lookup = (long_df[~long_df["is_section"].astype(bool)]
-                      .drop_duplicates("account")
-                      .set_index("account")["section"].to_dict())
-    rows = build_coa_rows(wide, future_df, model_report, flags, section_lookup)
-
-    return {
-        "rows": rows,
-        "debug_report": debug_report,
-        "model_report": model_report,
-        "flags": flags,
-        "last_actual_month": pd.Timestamp(wide.index.max()).strftime("%b %Y"),
-        "accounts": list(wide.columns),
-    }
