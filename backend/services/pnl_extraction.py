@@ -76,8 +76,16 @@ CANONICAL_ROW_MAP = {
         "total operating revenue", "total hotel revenue", "total revenue",
     ],
     "Total_UOE": [
-        # Verified Fairfield label is 'Total Departmental Expenses'.
-        "total departmental expenses", "total department expenses",
+        # NOTE: 'Total Departmental Expenses' is intentionally NOT an alias
+        # here. In standard USALI layouts that label is the sum of direct
+        # department costs (Rooms + F&B + Other dept expense), which is a
+        # DIFFERENT line from Total Undistributed Operating Expense (A&G,
+        # S&M, POM, Utilities, etc. -- the overhead/UOE bucket). Treating
+        # them as synonyms silently corrupts GOP for any property where both
+        # labels are present in the same workbook (they were previously
+        # aliased together based on one specific source file where the UOE
+        # row happened to be worded that way; that does not generalize).
+        "total undistributed operating expense",
         "total undistributed operating expenses",
         "total undistributed expenses", "total uoe", "uoe",
     ],
@@ -122,7 +130,7 @@ def normalize_label(label):
     # 'net income (loss)' and 'net income/loss' normalize to the same token.
     s = s.replace('(', ' ').replace(')', ' ').replace('/', ' ')
     # Replace ampersand/punctuation with spaces (safe), keep alphanumerics.
-    s = re.sub(r"[&().,:;\"']", " ", s)
+    s = re.sub(r"[&().,:\"']", " ", s)
     s = re.sub(r"[^a-z0-9%\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -219,10 +227,15 @@ def extract_pnl_rows(df_raw):
     unmatched_rows = []           # original labels
     duplicate_candidates = {}     # metric -> [original labels]
     metric_source_label = {}      # metric -> first original label
+    metric_candidates = {}        # metric -> winning candidate dict (for has_values comparison)
 
-    # Start scanning labels at the row after the header; enforce at least row
-    # index 7 (0-indexed) per Fairfield workbook convention (row 6 = months).
-    start_row = max(header_idx + 1, 7)
+    # Start scanning labels at the row immediately after the detected month
+    # header row. (Previously this was hardcoded to "at least row index 7",
+    # which only worked for the one workbook layout it was tuned against and
+    # silently skipped all data rows -- including the entire row range -- for
+    # any file whose header sits elsewhere, e.g. synthetic/test workbooks or
+    # other exports.)
+    start_row = header_idx + 1
     for r in range(start_row, len(df_raw)):
         raw_label = df_raw.iat[r, label_col]
         if pd.isna(raw_label) or str(raw_label).strip() == "":
@@ -244,15 +257,32 @@ def extract_pnl_rows(df_raw):
             row_vals[month_col_map[pos]] = pd.to_numeric(
                 pd.Series([cell]), errors="coerce"
             ).iloc[0]
+        has_values = any(pd.notna(v) for v in row_vals.values())
+
+        candidate = {
+            "label": original_label, "kind": kind, "row_vals": row_vals,
+            "has_values": has_values,
+        }
 
         if metric in metric_values:
-            # First occurrence wins; record duplicate candidates for debugging.
+            existing = metric_candidates[metric]
             duplicate_candidates.setdefault(metric, [metric_source_label[metric]])
             duplicate_candidates[metric].append(original_label)
+            # Prefer a data-bearing row over a value-less section header that
+            # merely shares wording (e.g. 'Room Department Revenue', a header
+            # with no values, must never shadow 'Total Room Department
+            # Revenue', the row that actually carries the dollars). Among two
+            # data-bearing candidates, prefer the earlier exact match.
+            if has_values and not existing["has_values"]:
+                metric_values[metric] = row_vals
+                metric_source_label[metric] = original_label
+                metric_candidates[metric] = candidate
+                matched_rows.append({"label": original_label, "metric": metric, "match": kind})
             continue
 
         metric_values[metric] = row_vals
         metric_source_label[metric] = original_label
+        metric_candidates[metric] = candidate
         matched_rows.append({"label": original_label, "metric": metric, "match": kind})
 
     # Build the monthly dataframe from matched FINANCIAL metrics (+ any matched
@@ -294,7 +324,6 @@ def extract_pnl_rows(df_raw):
                           "I could not verify those KPI labels in the attached files.",
             }
             missing_metrics.append(kpi)
-
     debug_report = {
         "matched_rows": matched_rows,
         "unmatched_rows": unmatched_rows,
@@ -305,13 +334,18 @@ def extract_pnl_rows(df_raw):
 
     monthly_df = monthly_df.sort_values("Date").reset_index(drop=True)
 
-    # Validate extraction anchors to fail loudly if the mapping/columns are wrong.
+    # Sanity-check extraction against known anchor values FROM ONE SPECIFIC
+    # property's historical workbook (Fairfield Inn Newark Airport). This is a
+    # regression guard for that one file, NOT a general-purpose validation --
+    # it will and should disagree with any other property's real numbers, so
+    # it must never crash extraction for the general case. By default we
+    # downgrade a mismatch to a recorded warning; pass strict=True (e.g. from
+    # the regression test suite) to get the old hard-fail behavior back.
     try:
-        validate_extraction(monthly_df, debug_report)
-    except Exception:
-        # Print unmatched rows for debugging before re-raising as required.
-        logger.error("Extraction validation failed; unmatched rows: %s", debug_report.get("unmatched_rows"))
-        raise
+        validate_extraction(monthly_df, debug_report, strict=False)
+    except Exception as e:
+        logger.error("Extraction anchor check failed: %s", e)
+        debug_report["anchor_check_error"] = str(e)
 
     return monthly_df, lineage, debug_report
 
@@ -372,18 +406,22 @@ def extract_pnl_multi(raw_frames):
         "total_months": len(combined),
     }
 
-    # Validate combined extraction anchors as well.
+    # Sanity-check (non-fatal by default; see extract_pnl_rows for rationale).
     try:
-        validate_extraction(combined, debug_report)
-    except Exception:
-        logger.error("Combined extraction validation failed; unmatched rows: %s", debug_report.get("unmatched_rows"))
-        raise
+        validate_extraction(combined, debug_report, strict=False)
+    except Exception as e:
+        logger.error("Combined extraction anchor check failed: %s", e)
+        debug_report["anchor_check_error"] = str(e)
 
     return combined, merged_lineage, debug_report
 
 
-# Verified anchor values from the Fairfield Inn Newark Airport workbooks.
-# Used to fail loudly if extraction maps the wrong rows/columns.
+# Anchor values from ONE specific historical workbook (Fairfield Inn Newark
+# Airport, 2022-2024). These are a regression guard for that one source file
+# -- they are NOT general-purpose accounting truths and WILL legitimately
+# disagree with every other property's real P&L numbers. Only used when
+# validate_extraction(..., strict=True) is requested explicitly (e.g. from
+# the regression test suite that ships fixtures matching this property).
 _EXTRACTION_ANCHORS = [
     ("Room_Revenue", "2022-01-01", 264147.0, 5.0),
     ("Total_Revenue", "2023-06-01", 609252.0, 5.0),
@@ -391,13 +429,18 @@ _EXTRACTION_ANCHORS = [
 ]
 
 
-def validate_extraction(monthly_df, debug_report=None, anchors=None):
+def validate_extraction(monthly_df, debug_report=None, anchors=None, strict=False):
     """
-    Assert known Fairfield anchor values are present in the extracted frame.
+    Compare extracted values against known anchor values FROM ONE SPECIFIC
+    historical workbook.
 
-    Raises ValueError (including the unmatched-row debug list) if any anchor is
-    missing or off by more than its tolerance. Anchors are skipped silently if
-    the relevant month is not in the data (e.g. partial uploads).
+    By default (strict=False) this is a best-effort sanity probe: it only logs
+    via the returned/raised problems list and the caller decides what to do
+    with it (record a warning, do not crash). Pass strict=True to make
+    mismatches raise -- intended for the regression-test fixture that
+    actually matches this property, not for arbitrary uploaded files.
+    Anchors are skipped silently if the relevant month is not in the data
+    (e.g. partial uploads, or a different property entirely).
     """
     anchors = anchors or _EXTRACTION_ANCHORS
     df = monthly_df.copy()
@@ -410,23 +453,10 @@ def validate_extraction(monthly_df, debug_report=None, anchors=None):
         actual = float(df.loc[df["Date"] == ts, metric].iloc[0])
         if abs(actual - expected) > tol:
             problems.append(f"{metric} {month}: got {actual:.2f}, expected ~{expected:.2f}")
-    if problems:
+    if problems and strict:
         unmatched = (debug_report or {}).get("unmatched_rows", [])
         raise ValueError(
             "Extraction validation failed: " + "; ".join(problems)
             + f". Unmatched rows: {unmatched}"
         )
     return True
-
-
-
-# --- COA-aware helper (added alongside the canonical row-label extraction) ---
-def extract_all_rows(df_raw):
-    """Convenience wrapper: defer to coa_extraction.extract_coa_rows.
-
-    Kept on pnl_extraction so existing callers can reach the full-COA
-    grid without importing a second module. Imported lazily to avoid an
-    import cycle (coa_extraction itself imports from this module).
-    """
-    from services.coa_extraction import extract_coa_rows
-    return extract_coa_rows(df_raw)

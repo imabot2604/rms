@@ -4,7 +4,9 @@ from services.data_processing import process_uploaded_files, generate_otb_pace
 from services.models import run_ensemble, forecast_excel_months
 from services.excel_timeline import coverage_frame
 from services.reconciliation import reconcile_topdown, reconciliation_error, COA_HIERARCHY
-from services.pnl_pipeline import build_pnl_forecast, build_coa_forecast
+from services.pnl_pipeline import build_pnl_forecast
+from services.coa_extraction import extract_coa_tree, extract_coa_tree_multi
+from services.coa_forecasting import forecast_coa_tree, reconciliation_diagnostics
 import io
 import logging
 import json
@@ -44,6 +46,32 @@ def _safe_float(val):
         return float(val)
     except (TypeError, ValueError):
         return None
+
+
+def _read_raw_frame(filename, data):
+    if filename.lower().endswith((".csv", ".txt")):
+        try:
+            df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str)
+            if df_raw.shape[1] <= 1:
+                df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, sep="\t")
+        except Exception:
+            df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, sep="\t")
+    else:
+        df_raw = pd.read_excel(io.BytesIO(data), header=None, dtype=str)
+    return df_raw
+
+
+def _read_all_raw_frames():
+    """
+    Parse EVERY uploaded workbook in Store.raw_workbooks, not just the first.
+
+    Previously both /forecast_pnl and /forecast_coa silently used only
+    Store.raw_workbooks[0] -- if a user uploaded multiple years of the same
+    property's P&L in one /upload call, only the first file was ever read
+    and the rest were discarded with no warning. Confirmed against real
+    2023/2024/2025 workbooks for the same property.
+    """
+    return [_read_raw_frame(fn, data) for fn, data in Store.raw_workbooks]
 
 
 @api_router.post("/upload")
@@ -290,20 +318,13 @@ async def get_forecast_pnl(horizon: int = 12):
         raise HTTPException(status_code=400, detail="Horizon must be between 1 and 36 months.")
 
     try:
-        # Read the first workbook as a header-less wide frame.
-        filename, data = Store.raw_workbooks[0]
-        if filename.lower().endswith((".csv", ".txt")):
-            try:
-                df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str)
-                if df_raw.shape[1] <= 1:
-                    df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, sep="\t")
-            except Exception:
-                df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, sep="\t")
-        else:
-            df_raw = pd.read_excel(io.BytesIO(data), header=None, dtype=str)
-
-        result = build_pnl_forecast(df_raw, horizon=horizon)
-        return {"status": "success", "horizon": horizon, **result}
+        frames = _read_all_raw_frames()
+        # Single file -> single-year extraction path (unchanged behavior).
+        # Multiple files -> concatenate as multi-year history (same property
+        # across years) so seasonal models get a real prior-year lag instead
+        # of being starved down to one file's months.
+        result = build_pnl_forecast(frames if len(frames) > 1 else frames[0], horizon=horizon)
+        return {"status": "success", "horizon": horizon, "file_count": len(frames), **result}
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -312,18 +333,32 @@ async def get_forecast_pnl(horizon: int = 12):
         raise HTTPException(status_code=500, detail=f"P&L forecasting error: {str(e)}")
 
 
-
 @api_router.get("/forecast_coa")
-async def get_forecast_coa(horizon: int = 12):
+async def get_forecast_coa(horizon: int = 6):
     """
-    Full Chart-of-Accounts forecast.
+    Full chart-of-accounts (COA) forecast: every numeric line item in the
+    uploaded workbook -- not just the ~10 canonical buckets -- including
+    department-level subtotals (e.g. Total Transient Revenue, Total Room
+    Department Revenue) and GL-coded leaf accounts (e.g.
+    "40010.000 . Transient - Best Available Rate").
 
-    Extracts every account row from the uploaded workbook(s) and forecasts
-    each leaf individually (SeasonalNaive for seasonal lines, zero-fill for
-    sparse, simple average otherwise). Historical months are returned as
-    untouched actuals; only future months are forecast. Per-row lineage
-    (value, source_type, forecast_model, confidence_flag, validation_notes,
-    section) is preserved.
+    The hierarchy is reconstructed generically from the workbook's own
+    numbers (a "Total X" row is matched against the contiguous block of
+    rows above it that sums to it), not from a hardcoded alias list, so it
+    works for any property's export.
+
+    Each node gets:
+      * a fitted value for every available (historical) month -- a
+        leakage-safe estimate using only strictly earlier months, so you
+        can see model-vs-actual on data you already have, not just future
+        months.
+      * a forecast for `horizon` months after the last actual.
+
+    Rollup nodes are exact sums of their children by construction (bottom-up
+    reconciliation), not independently modeled then scaled. Rollups the
+    algorithm could not verify (e.g. totals spanning non-contiguous
+    sections) are reported in `unverified_rollups` rather than silently
+    forced to match.
     """
     if not Store.raw_workbooks:
         raise HTTPException(status_code=400,
@@ -332,21 +367,37 @@ async def get_forecast_coa(horizon: int = 12):
         raise HTTPException(status_code=400, detail="Horizon must be between 1 and 36 months.")
 
     try:
-        frames = []
-        for filename, data in Store.raw_workbooks:
-            if filename.lower().endswith((".csv", ".txt")):
-                try:
-                    df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str)
-                    if df_raw.shape[1] <= 1:
-                        df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, sep="\t")
-                except Exception:
-                    df_raw = pd.read_csv(io.BytesIO(data), header=None, dtype=str, sep="\t")
-            else:
-                df_raw = pd.read_excel(io.BytesIO(data), header=None, dtype=str)
-            frames.append(df_raw)
+        frames = _read_all_raw_frames()
+        if len(frames) > 1:
+            nodes, roots, months, debug = extract_coa_tree_multi(frames)
+        else:
+            nodes, roots, months, debug = extract_coa_tree(frames[0])
+        rows = forecast_coa_tree(nodes, roots, months, horizon=horizon)
+        recon = reconciliation_diagnostics(nodes)
+        bad_recon = [d for d in recon if (d["max_residual"] or 0.0) > 1.0]
 
-        result = build_coa_forecast(frames if len(frames) > 1 else frames[0], horizon=horizon)
-        return {"status": "success", "horizon": horizon, **result}
+        response = {
+            "status": "success",
+            "horizon": horizon,
+            "file_count": len(frames),
+            "months": debug["months_detected"],
+            "node_count": debug["value_row_count"],
+            "root_count": debug["root_count"],
+            "reconciliation": {
+                "verified_rollup_count": len(recon),
+                "max_residual_over_$1": bad_recon,
+            },
+            "nodes": [n.to_dict() for n in nodes.values()],
+            "rows": rows,
+        }
+        if len(frames) > 1:
+            response["year_month_ranges"] = debug["year_month_ranges"]
+            response["incomplete_rollups"] = debug["incomplete_rollups"]
+            response["cross_year_parent_mismatches"] = debug["cross_year_parent_mismatches"]
+            response["label_collisions"] = debug["label_collisions"]
+        else:
+            response["unverified_rollups"] = debug["unverified_rollups"]
+        return response
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
